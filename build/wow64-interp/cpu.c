@@ -25,7 +25,10 @@
 //
 // Madeira's guest window: guest address a is host address B + a, where B comes
 // from NtQueryInformationProcess(ProcessWineIosWowGuestBase); on upstream Wine
-// the query fails and B is 0.
+// the query fails and B is 0. As with FEX's module in Madeira, what the 32-bit
+// side sees (registers, the two addresses above) is a guest address, and what
+// the 64-bit side dereferences (system call and unix call arguments, the
+// addresses in an exception record, which wow64.dll converts) is a host one.
 
 #include <stdint.h>
 #include <string.h>
@@ -282,7 +285,9 @@ void WINAPI BTCpuSimulate(void)
             case 0x2c: raise_guest(&s, cpu, STATUS_ASSERTION_FAILURE, (uint32_t)s.rip, eip, 0, 0, 0); break;
             case 0x2d: raise_guest(&s, cpu, STATUS_BREAKPOINT, (uint32_t)s.rip, eip, 1, (ULONG_PTR)(uint32_t)s.gpr[X64_RAX], 0); break;
             case 4: raise_guest(&s, cpu, STATUS_INTEGER_OVERFLOW, (uint32_t)s.rip, eip, 0, 0, 0); break;
-            default: raise_guest(&s, cpu, STATUS_ACCESS_VIOLATION, eip, eip, 2, 0, 0xffffffff); break;   // #GP on Windows
+            default:   // #GP on Windows: an access violation at 0xffffffff, which wow64 converts back from host
+                raise_guest(&s, cpu, STATUS_ACCESS_VIOLATION, eip, eip, 2, 0, (ULONG_PTR)host(0xffffffff));
+                break;
             }
             continue;
         case X64_EXIT_DIVIDE_ERROR:
@@ -317,6 +322,12 @@ NTSTATUS WINAPI BTCpuResetToConsistentState(EXCEPTION_POINTERS *pointers)
     s->rip = s->insn_start;
     store_state(&cpu_area()->Context, s);
     pointers->ExceptionRecord->ExceptionAddress = host((uint32_t)s->insn_start);
+#ifdef __x86_64__
+    // On an x86-64 host, wow64.dll gives the 32-bit handler the x87, MMX and SSE
+    // registers from this 64-bit context, as they would be after a fault in real
+    // 32-bit code: here they are the interpreter's, so put the guest's there.
+    x64_fxsave(s, &pointers->ContextRecord->FltSave);
+#endif
     slot->running = 0;
     return STATUS_SUCCESS;
 }
@@ -343,6 +354,11 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
     NTSTATUS status = NtAllocateVirtualMemory(CURRENT_PROCESS, &page, 0x7fffffff, &size,
                                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (status) return status;
+    // Madeira's ntdll puts a below-2-GB allocation of a WoW64 process in its guest window.
+    if (guest_base && ((uintptr_t)page < guest_base || (uintptr_t)page - guest_base >= 0x100000000ull)) {
+        DbgPrint("wow64interp: the dispatch page %p is outside the guest window at %p\n", page, (void *)guest_base);
+        return STATUS_NO_MEMORY;
+    }
     memset(page, 0xcc, 0x1000);
     bop_syscall = (uint32_t)((uintptr_t)page - guest_base);
     bop_unix = bop_syscall + 16;
@@ -357,14 +373,15 @@ void WINAPI BTCpuThreadInit(void)
     thread_slot(TRUE);
 }
 
+// Guest addresses: wow64.dll stores them where the 32-bit side reads them.
 void *WINAPI BTCpuGetBopCode(void)
 {
-    return host(bop_syscall);
+    return (void *)(ULONG_PTR)bop_syscall;
 }
 
 void *WINAPI __wine_get_unix_opcode(void)
 {
-    return host(bop_unix);
+    return (void *)(ULONG_PTR)bop_unix;
 }
 
 NTSTATUS WINAPI BTCpuGetContext(HANDLE thread, HANDLE process, void *unknown, WOW64_CONTEXT *context)
