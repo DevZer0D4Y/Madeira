@@ -10,6 +10,9 @@ enum JITMethod: String, CaseIterable, Identifiable {
     case automatic
     case stikDebug
     case builtIn
+    /// No debugger at all: Madeira's x86-64 interpreter (NoJIT.swift, docs/NO-JIT.md).
+    /// Games cannot start this way yet; Automatic never picks it.
+    case noJIT
 
     var id: String { rawValue }
     var title: String {
@@ -17,6 +20,7 @@ enum JITMethod: String, CaseIterable, Identifiable {
         case .automatic: return "Automatic"
         case .stikDebug: return "StikDebug"
         case .builtIn: return "Built-in StikJIT"
+        case .noJIT: return L("No JIT (experimental)")
         }
     }
 }
@@ -213,6 +217,10 @@ final class JITCoordinator: ObservableObject {
     }
 
     func enable(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard method != .noJIT else {
+            noJITRefusal(completion)
+            return
+        }
         guard SigningStatus.current.debuggable else {
             completion(.failure(NSError(
                 domain: "MadeiraJIT", code: 11,
@@ -338,7 +346,17 @@ final class JITCoordinator: ObservableObject {
                 return
             }
             enableBuiltIn(completion: completion)
+        case .noJIT:
+            noJITRefusal(completion)
         }
+    }
+
+    /// No JIT is the chosen method: say so rather than start a debugger.
+    private func noJITRefusal(_ completion: (Result<Void, Error>) -> Void) {
+        LogStore.shared.log("[no-jit] Enable JIT held: No JIT is the selected method")
+        error = NoJITEngine.enableMessage
+        showSetup = true
+        completion(.failure(CoordinatorError.setupRequired(NoJITEngine.enableMessage)))
     }
 
     func importPairingFile(_ source: URL) {
@@ -561,6 +579,10 @@ struct JITSettingsSection: View {
                 Text(coordinator.automaticDescription)
                     .font(.caption).foregroundStyle(.secondary)
             }
+            if coordinator.method == .noJIT {
+                Text("Madeira won't ask for a debugger. Games can't start this way yet; JIT setup has the engine check.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if JITShortcutFile.supported, let url = JITShortcutFile.url {
                 Button {
                     LogStore.shared.log("[jit-shortcut] add: iCloud link")
@@ -608,6 +630,10 @@ struct JITSetupView: View {
                         Text(coordinator.automaticDescription)
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    if coordinator.method == .noJIT {
+                        Text("Madeira won't ask for a debugger. Games can't start this way yet.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     LabeledContent("StikDebug",
                                    value: StikJITHelper.isAvailable ? L("Installed") : L("Not detected"))
                     LabeledContent("Built-in helper",
@@ -618,7 +644,9 @@ struct JITSetupView: View {
                     Text("Automatic uses StikDebug when it is installed. Madeira does not silently change methods after a failure.")
                 }
 
-                if coordinator.method != .stikDebug {
+                if coordinator.method == .noJIT {
+                    NoJITEngineSection()
+                } else if coordinator.method != .stikDebug {
                     Section {
                         LabeledContent("Pairing", value: pairingLabel)
                         if OnDevicePairing.isSupported {

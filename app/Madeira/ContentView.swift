@@ -2469,6 +2469,12 @@ struct ContentView: View {
     /// Madeira's Enable JIT instead of starting a launch that cannot get its pool.
     private func jitReadyForLaunch(inLibrary: Bool, entry: UUID? = nil, then launch: (() -> Void)? = nil) -> Bool {
         if StikJITHelper.ready { return true }
+        // No JIT (NoJIT.swift) asks for no debugger, and a game cannot start without one yet.
+        if jitCoordinator.method == .noJIT {
+            logStore.log("[no-jit] launch held: No JIT is selected and games still need JIT to start", level: .error)
+            if inLibrary { library.error = NoJITEngine.playMessage }
+            return false
+        }
         if inLibrary, let launch {
             logStore.log("[jit-on-play] JIT is not on: enabling it, then starting the game")
             launchAfterJIT = launch

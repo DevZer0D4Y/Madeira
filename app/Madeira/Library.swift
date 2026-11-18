@@ -2881,6 +2881,7 @@ struct LibraryBadges: View {
 struct LibraryStatus: View {
     @State private var jit = false
     @State private var memory = false
+    @ObservedObject private var jitCoordinator = JITCoordinator.shared
     let ticks = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2891,6 +2892,11 @@ struct LibraryStatus: View {
                     Text("Ready to play").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
                         .padding(.leading, 4)
                 }
+            }
+            if !jit && jitCoordinator.method == .noJIT {
+                Text("No JIT is selected, so Madeira won't ask for a debugger. Games can't start that way yet: choose Automatic under JIT to play.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if !memory {
                 Text("Memory+ requires the Increased Memory Limit entitlement in this signed copy of Madeira. Enabling JIT does not grant it. Check that your signing tool enables this capability for Madeira, then sign and install the updated app without deleting your existing installation.")

@@ -38,6 +38,8 @@ jobs:
           python3 tests/host/check-runtime-components.py
       - name: Check touch control layouts and editor
         run: python3 tests/host/check-control-presets.py
+      - name: Check the No JIT x86-64 interpreter
+        run: python3 tests/host/check-x64-interpreter.py
       - name: Check Steam connection recovery
         if: hashFiles('tests/host/check-steam-cm-transport.py') != ''
         run: python3 tests/host/check-steam-cm-transport.py

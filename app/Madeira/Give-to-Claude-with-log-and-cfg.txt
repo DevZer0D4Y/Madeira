@@ -200,6 +200,8 @@ in env.MADEIRA_SMALL_STACK_EXES.
 [library] ml1163 start=direct/desktop ...   how the game page launched it
 [game-cfg], [madeira-env]   which settings applied (section 2)
 JIT pool: RX=... size=   pool actually reserved
+[no-jit] launch held     Settings > JIT is No JIT (experimental), which
+                         cannot start games yet: choose Automatic
 [jit-pool] EXHAUSTED     pool full: pool-split / NOCOPY (sec 5)
 [dll-missing] status=c0000017   out of memory loading a DLL
 [dll-missing] other status   DLL not found (summary hides harmless ones)

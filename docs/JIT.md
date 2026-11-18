@@ -5,6 +5,9 @@ use either the StikDebug app or its built-in StikJIT helper. Both methods send
 the same bundled `madeira-jit.js` debugger script to the current Madeira
 process.
 
+[No JIT (experimental)](NO-JIT.md), the fourth choice under **Settings → JIT**,
+asks for no debugger at all. It cannot start games yet.
+
 ## Automatic selection
 
 The default **Automatic** method uses StikDebug when iOS reports that its

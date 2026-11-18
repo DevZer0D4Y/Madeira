@@ -122,6 +122,7 @@ containing the iOS work; upstream clones will not build here.
 |---|---|
 | Building from a clean checkout | [`docs/BUILDING.md`](docs/BUILDING.md) |
 | StikDebug and built-in JIT setup | [`docs/JIT.md`](docs/JIT.md) |
+| No JIT (experimental): the x86-64 interpreter | [`docs/NO-JIT.md`](docs/NO-JIT.md) |
 | The game library | [`docs/LIBRARY.md`](docs/LIBRARY.md) |
 | Steam sign-in, library and downloads | [`docs/STEAM_SIGNIN.md`](docs/STEAM_SIGNIN.md), [`docs/STEAM_LIBRARY.md`](docs/STEAM_LIBRARY.md) |
 | Steam Cloud saves | [`docs/STEAM_CLOUD.md`](docs/STEAM_CLOUD.md) |
