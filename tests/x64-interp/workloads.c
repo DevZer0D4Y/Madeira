@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 //
-// Programs for the No JIT self-check. gen-selfcheck.py compiles them for
-// x86-64 with the Windows calling convention (-mabi=ms) into one flat,
-// position-independent blob, runs each natively for its expected result, and
-// writes app/Madeira/NoJITSelfCheckData.h. On the device the interpreter runs
-// the same bytes and must give the same results.
+// Programs for the No JIT self-check. gen-selfcheck.py compiles them twice:
+// for x86-64 with the Windows calling convention (-mabi=ms), and for 32-bit
+// x86 with x87 floating point (-m32 -mfpmath=387), as older games are built.
+// Each build is one flat, position-independent blob; each entry runs natively
+// for its expected result, and app/Madeira/NoJITSelfCheckData.h holds both. On
+// the device the interpreter runs the same bytes and must give the same results.
 //
 // Every entry takes (seed, a zeroed 64 KiB buffer, a callback) and returns a
 // checksum. Nothing here calls a library: the blob is all there is.
 
-#include <emmintrin.h>
-#include <pmmintrin.h>
 #include <stddef.h>
 #include <stdint.h>
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#include <pmmintrin.h>
+#else
+#include <mmintrin.h>
+#include <xmmintrin.h>
+#endif
 
 #define ENTRY __attribute__((used, noinline))
 
@@ -124,10 +130,15 @@ ENTRY uint64_t wl_divide(uint64_t seed, uint8_t *buf, callback_fn cb)
         h = mix(h, (uint32_t)a / (uint32_t)(b | 3));
         h = mix(h, (uint64_t)((int32_t)a % (int32_t)(sb | 5)));
         h = mix(h, (uint16_t)a / (uint16_t)(b | 7));
+#if defined(__SIZEOF_INT128__)
         unsigned __int128 p = (unsigned __int128)a * b;
         __int128 q = (__int128)sa * sb;
         h = mix(h, (uint64_t)(p >> 64) ^ (uint64_t)p);
         h = mix(h, (uint64_t)(q >> 64) ^ (uint64_t)q);
+#else
+        h = mix(h, a * b);
+        h = mix(h, (uint64_t)(sa * sb));
+#endif
     }
     return h;
 }
@@ -168,6 +179,7 @@ ENTRY uint64_t wl_float(uint64_t seed, uint8_t *buf, callback_fn cb)
     return mix(h, ua.u);
 }
 
+#if defined(__x86_64__)
 ENTRY uint64_t wl_simd(uint64_t seed, uint8_t *buf, callback_fn cb)
 {
     (void)cb;
@@ -201,6 +213,66 @@ ENTRY uint64_t wl_simd(uint64_t seed, uint8_t *buf, callback_fn cb)
     h = mix(h, (uint64_t)_mm_cvtsi128_si64(acc2));
     return mix(h, (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(acc2, acc2)));
 }
+#else
+// MMX and the integer SSE additions to it (PSHUFW, PSADBW, PMINUB...), as games
+// of the Pentium III era used them.
+ENTRY uint64_t wl_mmx(uint64_t seed, uint8_t *buf, callback_fn cb)
+{
+    (void)cb;
+    __m64 *v = (__m64 *)buf;
+    uint64_t x = seed, h = 0;
+    for (int i = 0; i < 256; i++) v[i] = _mm_set_pi32((int)next(&x), (int)next(&x));
+    __m64 acc = _mm_setzero_si64(), acc2 = _mm_set1_pi16(0x0102);
+    for (int i = 0; i < 255; i++) {
+        __m64 a = v[i], b = v[i + 1];
+        acc = _mm_add_pi32(acc, _mm_madd_pi16(a, b));
+        acc = _mm_xor_si64(acc, _mm_unpackhi_pi8(a, b));
+        acc2 = _mm_adds_pu8(acc2, _mm_avg_pu8(a, b));
+        acc2 = _mm_subs_pi16(acc2, _mm_mullo_pi16(a, b));
+        acc2 = _mm_max_pi16(acc2, _mm_min_pi16(a, _mm_srli_si64(b, 13)));
+        acc = _mm_add_pi16(acc, _mm_packs_pi32(_mm_srai_pi32(a, 9), _mm_srli_pi32(b, 13)));
+        acc = _mm_xor_si64(acc, _mm_shuffle_pi16(b, 0x93));
+        h = mix(h, (uint64_t)_mm_movemask_pi8(_mm_cmpgt_pi16(a, b)));
+        h = mix(h, (uint64_t)(uint32_t)_mm_cvtsi64_si32(_mm_sad_pu8(a, b)));
+        h = mix(h, (uint64_t)(uint32_t)_mm_cvtsi64_si32(_mm_unpacklo_pi16(acc, acc2)));
+    }
+    union { __m64 m; uint64_t u; } r1 = { acc }, r2 = { acc2 };
+    _mm_empty();
+    return mix(mix(h, r1.u), r2.u);
+}
+
+// x87 work as a 1990s compiler leaves it: double arithmetic on the stack,
+// float and integer conversions (FISTP after FLDCW to truncation for C casts),
+// 64-bit integers through FILD/FISTP, comparisons through FNSTSW.
+ENTRY uint64_t wl_x87(uint64_t seed, uint8_t *buf, callback_fn cb)
+{
+    (void)cb;
+    double *p = (double *)buf;
+    float *f = (float *)(buf + 8192);
+    uint64_t x = seed, h = 0;
+    for (int i = 0; i < 512; i++) {
+        p[i] = (double)(int64_t)(next(&x) % 2000001 - 1000000) / 64.0;
+        f[i] = (float)(next(&x) % 10000) * 0.01f - 50.0f;
+    }
+    double acc = 0, poly = 0;
+    for (int i = 0; i < 512; i++) {
+        double t = p[i] * 0.001;
+        poly = ((((t * 0.5 - 1.25) * t + 2.0) * t - 0.75) * t + 0.125);
+        acc += poly * (double)f[i] - __builtin_sqrt(p[i] * p[i] + 1.0);
+        int truncated = (int)(p[i] / 3.0);
+        long long wide = (long long)(p[i] * 1048576.0);
+        h = mix(h, (uint64_t)(uint32_t)truncated);
+        h = mix(h, (uint64_t)wide);
+        h = mix(h, (uint64_t)(int64_t)((double)wide / 7.0));
+        h = mix(h, p[i] < f[i] ? 1 : p[i] > f[i] ? 2 : 3);
+        float g = (float)(acc / 1024.0);
+        union { float v; uint32_t u; } ug = { g };
+        h = mix(h, ug.u);
+    }
+    union { double v; uint64_t u; } ua = { acc }, up = { poly };
+    return mix(mix(h, ua.u), up.u);
+}
+#endif
 
 ENTRY uint64_t wl_strings(uint64_t seed, uint8_t *buf, callback_fn cb)
 {
@@ -214,10 +286,16 @@ ENTRY uint64_t wl_strings(uint64_t seed, uint8_t *buf, callback_fn cb)
         const void *s = a + (next(&x) % 1000);
         size_t c = n;
         __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(c) : : "memory");
-        uint64_t fill = 0x0101010101010101ull * (uint8_t)round;
         void *e = b + 4096 + round * 8;
+#if defined(__x86_64__)
+        uint64_t fill = 0x0101010101010101ull * (uint8_t)round;
         c = 16;
         __asm__ volatile("rep stosq" : "+D"(e), "+c"(c) : "a"(fill) : "memory");
+#else
+        uint32_t fill = 0x01010101u * (uint8_t)round;
+        c = 32;
+        __asm__ volatile("rep stosl" : "+D"(e), "+c"(c) : "a"(fill) : "memory");
+#endif
         const void *p = b + off, *q = a;
         c = n;
         __asm__ volatile("repe cmpsb" : "+D"(p), "+S"(q), "+c"(c) : : "memory", "cc");
@@ -315,8 +393,12 @@ ENTRY uint64_t wl_bits(uint64_t seed, uint8_t *buf, callback_fn cb)
         h = mix(h, __builtin_bswap32((uint32_t)b));
         h = mix(h, n ? (a << n) | (b >> (64 - n)) : a);
         h = mix(h, n ? (a >> n) | (b << (64 - n)) : a);
+#if defined(__SIZEOF_INT128__)
         unsigned __int128 s = (unsigned __int128)a + b + h;
         h = mix(h, (uint64_t)(s >> 64));
+#else
+        h = mix(h, a + b + h);
+#endif
         int64_t o;
         uint32_t o32;
         h = mix(h, (uint64_t)__builtin_add_overflow((int64_t)a, (int64_t)b, &o) + (uint64_t)o);
@@ -333,7 +415,11 @@ ENTRY uint64_t wl_atomic(uint64_t seed, uint8_t *buf, callback_fn cb)
 {
     (void)cb;
     uint64_t *slots = (uint64_t *)buf;
+#if defined(__SIZEOF_INT128__)
     unsigned __int128 *wide = (unsigned __int128 *)(buf + 4096);
+#else
+    uint64_t *wide = (uint64_t *)(buf + 4096);   // CMPXCHG8B
+#endif
     uint32_t *small = (uint32_t *)(buf + 8192);
     uint64_t x = seed, h = 0;
     for (int i = 0; i < 3000; i++) {
@@ -346,15 +432,24 @@ ENTRY uint64_t wl_atomic(uint64_t seed, uint8_t *buf, callback_fn cb)
         h = mix(h, __atomic_compare_exchange_n(p, &expected, expected + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
         expected = r;
         h = mix(h, __atomic_compare_exchange_n(p, &expected, 5, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) + expected);
+#if defined(__SIZEOF_INT128__)
         unsigned __int128 old = wide[r % 8];
+#else
+        uint64_t old = wide[r % 8];
+#endif
         h = mix(h, __sync_bool_compare_and_swap(&wide[r % 8], old, old + r));
         h = mix(h, __atomic_add_fetch(&small[r % 16], (uint32_t)r, __ATOMIC_SEQ_CST));
         h = mix(h, __atomic_fetch_sub(&small[(r >> 4) % 16], 3u, __ATOMIC_SEQ_CST));
     }
+#if defined(__SIZEOF_INT128__)
     for (int i = 0; i < 8; i++) h = mix(h, (uint64_t)wide[i] ^ (uint64_t)(wide[i] >> 64));
+#else
+    for (int i = 0; i < 8; i++) h = mix(h, wide[i]);
+#endif
     return h;
 }
 
+#if defined(__x86_64__)
 ENTRY uint64_t wl_rounding(uint64_t seed, uint8_t *buf, callback_fn cb)
 {
     (void)buf; (void)cb;
@@ -383,3 +478,32 @@ ENTRY uint64_t wl_rounding(uint64_t seed, uint8_t *buf, callback_fn cb)
     __asm__ volatile("ldmxcsr %0" : : "m"(saved));
     return h;
 }
+#else
+ENTRY uint64_t wl_rounding(uint64_t seed, uint8_t *buf, callback_fn cb)
+{
+    (void)buf; (void)cb;
+    uint16_t saved, mode;
+    __asm__ volatile("fnstcw %0" : "=m"(saved));
+    uint64_t x = seed, h = 0;
+    for (unsigned rc = 0; rc < 4; rc++) {
+        mode = (uint16_t)((saved & ~0x0c00u) | (rc << 10));
+        __asm__ volatile("fldcw %0" : : "m"(mode));
+        for (int i = 0; i < 200; i++) {
+            double a = (double)(int64_t)(next(&x) % 2000001 - 1000000) / 8.0;
+            int32_t r32;
+            int64_t r64;
+            __asm__ volatile("fistpl %0" : "=m"(r32) : "t"(a) : "st");
+            __asm__ volatile("fistpll %0" : "=m"(r64) : "t"(a * 4096.0) : "st");
+            h = mix(h, (uint32_t)r32);
+            h = mix(h, (uint64_t)r64);
+            double q = a / 3.0;
+            float fs = (float)q;
+            union { double d; uint64_t u; } u1 = { q };
+            union { float f; uint32_t u; } u2 = { fs };
+            h = mix(h, u1.u); h = mix(h, u2.u);
+        }
+    }
+    __asm__ volatile("fldcw %0" : : "m"(saved));
+    return h;
+}
+#endif

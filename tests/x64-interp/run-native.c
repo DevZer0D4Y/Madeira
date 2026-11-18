@@ -2,7 +2,8 @@
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 //
 // Runs the self-check programs natively on an x86-64 host: the reference
-// results gen-selfcheck.py records. Linux or macOS on x86-64.
+// results gen-selfcheck.py records. Built 64-bit for the 64-bit blob and with
+// -m32 for the 32-bit one. Linux on x86-64.
 //
 // Usage: run-native BLOB NAME:OFFSET:SEED...   prints NAME SEED RESULT per line
 
@@ -14,10 +15,15 @@
 #include <string.h>
 #include <sys/mman.h>
 
-typedef uint64_t (__attribute__((ms_abi)) *callback_fn)(uint64_t, uint64_t);
-typedef uint64_t (__attribute__((ms_abi)) *entry_fn)(uint64_t, void *, callback_fn);
+#if defined(__x86_64__)
+#define ABI __attribute__((ms_abi))   // the 64-bit programs are Windows x64 code
+#else
+#define ABI                           // the 32-bit ones are cdecl
+#endif
+typedef uint64_t (ABI *callback_fn)(uint64_t, uint64_t);
+typedef uint64_t (ABI *entry_fn)(uint64_t, void *, callback_fn);
 
-static uint64_t __attribute__((ms_abi)) callback(uint64_t a, uint64_t b)
+static uint64_t ABI callback(uint64_t a, uint64_t b)
 {
     return madeira_nojit_callback(a, b);
 }
@@ -38,7 +44,15 @@ int main(int argc, char **argv)
         unsigned long long offset, seed;
         if (sscanf(argv[i], "%63[^:]:%llx:%llx", name, &offset, &seed) != 3) return 2;
         memset(scratch, 0, 64 * 1024);
+#if defined(__i386__)
+        // Windows starts threads with x87 at 53-bit precision (0x27F), Linux at 64-bit.
+        uint16_t windows = 0x27f, saved;
+        __asm__ volatile("fnstcw %0\n\tfldcw %1" : "=m"(saved) : "m"(windows));
+#endif
         uint64_t result = ((entry_fn)(code + offset))(seed, scratch, callback);
+#if defined(__i386__)
+        __asm__ volatile("fldcw %0" : : "m"(saved));
+#endif
         printf("%s %llx %llx\n", name, seed, (unsigned long long)result);
     }
     return 0;

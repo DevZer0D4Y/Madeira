@@ -34,88 +34,7 @@
 #include <xmmintrin.h>
 #endif
 
-#define CODE    0x30000000ul
-#define ANCHOR  0x30100000ul
-#define MEM     0x30200000ul
-#define MEMSZ   0x4000ul
-#define STACK   0x30300000ul
-#define STACKSZ 0x2000ul
-
-enum {
-    RCX_SMALL = 1 << 0, R8_SMALL = 1 << 1, BITOFF = 1 << 2, POPF = 1 << 3, XLAT = 1 << 4,
-    APPROX = 1 << 5, NOMEM = 1 << 6, SSE = 1 << 7, RCX17 = 1 << 8, DIV = 1 << 9,
-};
-
-struct Template { const uint8_t *start, *end; const char *name; uint64_t undef, flags; };
-
-struct NState {
-    uint64_t gpr[16];
-    uint64_t flags;
-    uint32_t mxcsr, pad;
-    uint8_t gap[0x100 - 0x90];
-    X64Vec xmm[16];
-};
-
-#define IN  ((struct NState *)ANCHOR)
-#define OUT ((struct NState *)(ANCHOR + 0x400))
-#define COUNT(a) (sizeof(a) / sizeof((a)[0]))
-
-static uint64_t rng;
-static uint64_t rnd(void)
-{
-    rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
-    return rng * 0x2545F4914F6CDD1Dull;
-}
-
-static const uint64_t special64[] = {
-    0, 1, 2, 3, 0x7f, 0x80, 0xff, 0x100, 0x7fff, 0x8000, 0xffff, 0x10000, 0x7fffffff, 0x80000000,
-    0xffffffff, 0x100000000, 0x7fffffffffffffff, 0x8000000000000000, 0xffffffffffffffff, 0xfffffffffffffffe,
-    0x8000000000000001, 0x00000000ffffff80, 0xffffffff80000000, 0x5555555555555555, 0xaaaaaaaaaaaaaaaa,
-};
-static const uint32_t special32f[] = {
-    0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3f000000, 0x3fc00000, 0x40200000, 0xc0200000,
-    0x7f800000, 0xff800000, 0x7fc00000, 0x7fa00000, 0xffc00001, 0x7fc12345, 0x00000001, 0x007fffff,
-    0x80000010, 0x7f7fffff, 0x00800000, 0x4f000000, 0xcf000000, 0x4effffff, 0x501502f9, 0x40400000,
-    0x3f800001, 0xdf000000, 0x5f000000, 0x3effffff, 0x00400000, 0x0f800000,
-};
-static const uint64_t special64f[] = {
-    0x0000000000000000, 0x8000000000000000, 0x3ff0000000000000, 0xbff0000000000000, 0x3fe0000000000000,
-    0x3ff8000000000000, 0x4004000000000000, 0xc004000000000000, 0x7ff0000000000000, 0xfff0000000000000,
-    0x7ff8000000000000, 0x7ff4000000000000, 0xfff8000000000123, 0x0000000000000001, 0x000fffffffffffff,
-    0x0010000000000000, 0x7fefffffffffffff, 0x43e0000000000000, 0xc3e0000000000000, 0x41dfffffffc00000,
-    0x41e0000000000000, 0xc1e0000000000000, 0x41dfffffffe00000, 0x3810000000000000, 0x47efffffe0000000,
-    0x36a0000000000000, 0x3fefffffffffffff, 0x4330000000000001,
-};
-
-static uint64_t rnd_int(void)
-{
-    switch (rnd() % 8) {
-    case 0: case 1: return special64[rnd() % COUNT(special64)];
-    case 2: return rnd() & 0xff;
-    case 3: return rnd() & 0xffff;
-    case 4: return rnd() & 0xffffffff;
-    case 5: return (uint64_t)(int64_t)(int32_t)rnd();
-    case 6: return (uint64_t)((int64_t)(rnd() % 9) - 4);
-    default: return rnd();
-    }
-}
-
-static void rnd_vec(X64Vec *v)
-{
-    switch (rnd() % 3) {
-    case 0:
-        for (int i = 0; i < 4; i++)
-            v->d[i] = rnd() % 3 ? special32f[rnd() % COUNT(special32f)] : (uint32_t)rnd();
-        break;
-    case 1:
-        for (int i = 0; i < 2; i++)
-            v->q[i] = rnd() % 3 ? special64f[rnd() % COUNT(special64f)] : rnd();
-        break;
-    default:
-        v->q[0] = rnd_int(); v->q[1] = rnd_int();
-        break;
-    }
-}
+#include "fuzz-common.h"
 
 // Random input state and memory for one trial. Uses the generator in the same
 // order on every host, which is what lets replay regenerate a recorded input.
@@ -178,26 +97,8 @@ static void dump_input(void)
         fprintf(stderr, "    xmm%d=%016llx:%016llx\n", i, (unsigned long long)IN->xmm[i].q[1], (unsigned long long)IN->xmm[i].q[0]);
 }
 
-static bool approx_equal(uint32_t a, uint32_t b)
-{
-    float fa, fb;
-    memcpy(&fa, &a, 4); memcpy(&fb, &b, 4);
-    if (a == b) return true;
-    if (isnan(fa) && isnan(fb)) return true;
-    if (fa == 0 || fb == 0) return (fa == 0) == (fb == 0) && fabsf(fa - fb) < 1e-30f;
-    return fabsf(fa - fb) <= fabsf(fb) * (1.0f / 2048);
-}
 
-static uint64_t hash(const void *p, size_t n)
-{
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t *)p)[i]) * 0x100000001b3ull;
-    return h;
-}
 
-static sigjmp_buf fault_jump;
-static volatile int fault_signal;
-static void on_fault(int sig) { fault_signal = sig; siglongjmp(fault_jump, 1); }
 
 static uint64_t fs_base, gs_base = MEM;
 static uint8_t mem_snapshot[MEMSZ], stack_snapshot[STACKSZ];
@@ -274,23 +175,7 @@ static void interpret_and_compare(size_t pre, size_t len, uint64_t undef, uint64
     }
 }
 
-static bool map_fixed(unsigned long address, size_t size, int prot)
-{
-    return mmap((void *)address, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == (void *)address;
-}
 
-static void catch_faults(void)
-{
-    static uint8_t altstack[65536];
-    stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack };
-    sigaltstack(&ss, NULL);
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_fault;
-    sa.sa_flags = SA_ONSTACK | SA_NODEFER;
-    int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP };
-    for (size_t i = 0; i < COUNT(sigs); i++) sigaction(sigs[i], &sa, NULL);
-}
 
 #if defined(__x86_64__)
 extern const struct Template fuzz_templates[];
@@ -302,8 +187,9 @@ static uint8_t mem_native[MEMSZ], stack_native[STACKSZ];
 static int run_native(void)
 {
     unsigned host_mxcsr = _mm_getcsr();
+    void (*volatile snippet)(void) = (void (*)(void))CODE;   // not a direct call: see fuzz32.c
     fault_signal = 0;
-    if (sigsetjmp(fault_jump, 1) == 0) ((void (*)(void))CODE)();
+    if (sigsetjmp(fault_jump, 1) == 0) snippet();
     _mm_setcsr(host_mxcsr);
     __asm__ volatile("fninit");
     return fault_signal;
@@ -376,11 +262,144 @@ static int run_or_record(long trials, const char *filter, FILE *record)
 }
 #endif
 
+
+// x87 registers equal, or (APPROX) equal as doubles to about 9 digits. A native
+// result outside double's exponent range is not compared: the interpreter's
+// arithmetic is double's (docs/NO-JIT.md).
+static bool f80_close(const uint8_t *a, const uint8_t *b, bool approx)
+{
+    if (!memcmp(a, b, 10)) return true;
+    uint64_t ma, mb;
+    uint16_t ea, eb;
+    memcpy(&ma, a, 8); memcpy(&ea, a + 8, 2);
+    memcpy(&mb, b, 8); memcpy(&eb, b + 8, 2);
+    int native_exponent = (eb & 0x7fff) - 16383;
+    if (mb && (eb & 0x7fff) != 0x7fff && (native_exponent > 1023 || native_exponent < -1022)) return true;
+    if (!approx) return false;
+    long double x = ldexpl((long double)ma, (ea & 0x7fff) - 16383 - 63), y = ldexpl((long double)mb, (eb & 0x7fff) - 16383 - 63);
+    if (ea & 0x8000) x = -x;
+    if (eb & 0x8000) y = -y;
+    if (isnan((double)x) && isnan((double)y)) return true;
+    return fabsl(x - y) <= fabsl(y) * 1e-9L;
+}
+
+// x64_run with faults caught; nothing of the caller's lives across the jump.
+static X64Exit run_guarded(X64State *s, const X64Env *env, X64ExitInfo *info)
+{
+    volatile X64Exit exit = X64_EXIT_BUDGET;
+    fault_signal = 0;
+    if (sigsetjmp(fault_jump, 1) == 0) exit = x64_run(s, env, 100000, info);
+    return exit;
+}
+
+static int replay32(FILE *f)
+{
+    uint64_t header[4];
+    uint16_t sel[6];
+    if (fread(header, sizeof header, 1, f) != 1 || fread(sel, sizeof sel, 1, f) != 1) return 2;
+    uint64_t count = header[0], trials = header[1], pre = header[3];
+    rng = header[2];
+    long failures = 0, failed_templates = 0, runs = 0, skipped = 0;
+    static const char *const names32[8] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi" };
+    for (uint64_t n = 0; n < count; n++) {
+        uint32_t name_len, code_len;
+        char name[512];
+        uint64_t undef, flags;
+        if (fread(&name_len, 4, 1, f) != 1 || name_len >= sizeof name || fread(name, 1, name_len, f) != name_len) return 2;
+        name[name_len] = 0;
+        if (fread(&code_len, 4, 1, f) != 1 || code_len > 4096 || fread((uint8_t *)CODE + pre, 1, code_len, f) != code_len) return 2;
+        if (fread(&undef, 8, 1, f) != 1 || fread(&flags, 8, 1, f) != 1) return 2;
+        int template_failures = 0;
+        for (uint64_t trial = 0; trial < trials; trial++) {
+            struct NState32 expect;
+            uint64_t hashes[2];
+            uint8_t faulted;
+            if (fread(&expect, sizeof expect, 1, f) != 1 || fread(hashes, sizeof hashes, 1, f) != 1 || fread(&faulted, 1, 1, f) != 1)
+                return 2;
+            setup_input32(flags);
+            if (faulted || template_failures >= 3) { skipped++; continue; }
+            X64State s;
+            x64_state_init32(&s, 0);
+            for (int i = 0; i < 8; i++) s.gpr[i] = IN32->gpr[i];
+            s.rflags = IN32->eflags;
+            x64_fxrstor(&s, IN32->fx);
+            s.seg_cs = sel[0]; s.seg_ds = sel[1]; s.seg_es = sel[2]; s.seg_ss = sel[3]; s.seg_fs = sel[4]; s.seg_gs = sel[5];
+            s.rip = CODE + pre;
+            X64Env env = { .stop_rip = CODE + pre + code_len };
+            X64ExitInfo info;
+            X64Exit exit = run_guarded(&s, &env, &info);
+            runs++;
+
+            char why[1024];
+            int k = 0;
+            why[0] = 0;
+            if (fault_signal) snprintf(why, sizeof why, " interpreter faulted with signal %d", fault_signal);
+            else if (exit != X64_EXIT_STOP) {
+                k = snprintf(why, sizeof why, " exit %s at %llx:", x64_exit_name(exit), (unsigned long long)info.rip);
+                for (int i = 0; i < info.length; i++) k += snprintf(why + k, sizeof why - (size_t)k, " %02x", info.bytes[i]);
+            } else {
+                uint8_t fx[512];
+                memset(fx, 0, sizeof fx);
+                x64_fxsave(&s, fx);
+                for (int i = 0; i < 8; i++) {
+                    uint32_t mask = 0xffffffffu;
+                    if ((flags & FSWAX) && (i == 0 || i == 3)) mask = 0xffff7d00u | ((flags & CMPC1) ? 0x200 : 0);
+                    if (((uint32_t)s.gpr[i] ^ expect.gpr[i]) & mask)
+                        k += snprintf(why + k, sizeof why - (size_t)k, " %s: native %x interp %x;", names32[i], expect.gpr[i], (uint32_t)s.gpr[i]);
+                }
+                uint32_t fmask = 0xcd5u & ~(uint32_t)undef;
+                if (((uint32_t)s.rflags ^ expect.eflags) & fmask)
+                    k += snprintf(why + k, sizeof why - (size_t)k, " eflags: native %x interp %x;", expect.eflags & fmask, (uint32_t)s.rflags & fmask);
+                uint16_t ncw, icw, nsw, isw;
+                memcpy(&ncw, expect.fx, 2); memcpy(&icw, fx, 2);
+                memcpy(&nsw, expect.fx + 2, 2); memcpy(&isw, fx + 2, 2);
+                // C0-C3 are undefined after the transcendental instructions (APPROX): TOP and C2 only.
+                uint16_t swmask = (flags & APPROX) ? 0x3c00 : 0x7d00 | ((flags & CMPC1) ? 0x200 : 0);
+                if (ncw != icw) k += snprintf(why + k, sizeof why - (size_t)k, " fcw: native %x interp %x;", ncw, icw);
+                if ((nsw ^ isw) & swmask) k += snprintf(why + k, sizeof why - (size_t)k, " fsw: native %x interp %x;", nsw, isw);
+                if (expect.fx[4] != fx[4]) k += snprintf(why + k, sizeof why - (size_t)k, " ftw: native %x interp %x;", expect.fx[4], fx[4]);
+                int top = (nsw >> 11) & 7;
+                for (int i = 0; i < 8 && k < 800; i++) {
+                    bool used = (expect.fx[4] >> ((top + i) & 7)) & 1;
+                    const uint8_t *a = fx + 32 + 16 * i, *b = expect.fx + 32 + 16 * i;
+                    if ((used || (flags & MMX)) && !f80_close(a, b, (flags & APPROX) != 0)) {
+                        uint64_t ma, mb; uint16_t ea, eb;
+                        memcpy(&ma, a, 8); memcpy(&ea, a + 8, 2); memcpy(&mb, b, 8); memcpy(&eb, b + 8, 2);
+                        k += snprintf(why + k, sizeof why - (size_t)k, " st%d: native %04x:%016llx interp %04x:%016llx;", i,
+                                      eb, (unsigned long long)mb, ea, (unsigned long long)ma);
+                    }
+                }
+                for (int i = 0; i < 8 && k < 800; i++)
+                    if (memcmp(fx + 160 + 16 * i, expect.fx + 160 + 16 * i, 16))
+                        k += snprintf(why + k, sizeof why - (size_t)k, " xmm%d differs;", i);
+                uint32_t nmx, imx;
+                memcpy(&nmx, expect.fx + 24, 4); memcpy(&imx, fx + 24, 4);
+                if ((nmx ^ imx) & 0xffc0) k += snprintf(why + k, sizeof why - (size_t)k, " mxcsr: native %x interp %x;", nmx, imx);
+                if (!(flags & NOMEM)) {
+                    if (hash((void *)MEM, MEMSZ) != hashes[0]) k += snprintf(why + k, sizeof why - (size_t)k, " memory differs;");
+                    if (hash((void *)STACK, STACKSZ) != hashes[1]) k += snprintf(why + k, sizeof why - (size_t)k, " stack differs;");
+                }
+            }
+            if (why[0]) {
+                failures++;
+                if (!template_failures) failed_templates++;
+                template_failures++;
+                if (template_failures == 1) fprintf(stderr, "FAIL [%s]%s\n", name, why);
+            }
+        }
+    }
+    printf("replayed %llu 32-bit snippets: %ld runs, %ld failures in %ld snippets, %ld skipped\n",
+           (unsigned long long)count, runs, failures, failed_templates, skipped);
+    return failures ? 1 : 0;
+}
+
 static int replay(FILE *f)
 {
     char magic[8];
     uint64_t header[4];
-    if (fread(magic, 8, 1, f) != 1 || memcmp(magic, "X64FUZZ1", 8) || fread(header, sizeof header, 1, f) != 1) {
+    if (fread(magic, 8, 1, f) != 1) return 2;
+    if (!memcmp(magic, "X86FUZZ1", 8)) return replay32(f);
+    if (memcmp(magic, "X64FUZZ1", 8) || fread(header, sizeof header, 1, f) != 1) {
         fprintf(stderr, "not a recording\n");
         return 2;
     }

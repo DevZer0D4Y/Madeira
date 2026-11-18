@@ -71,8 +71,10 @@
 // Decoding
 
 typedef struct Dec {
-    uint64_t start, next;
-    const uint8_t *begin, *p;
+    uint64_t start, next;       // guest addresses
+    const uint8_t *begin, *p;   // host pointers to the bytes
+    bool m32;                   // 32-bit mode
+    uint64_t gbase;             // guest_base, in 32-bit mode
     uint8_t rex;
     uint8_t rep;            // 0, 0xF2 or 0xF3: the last of them
     bool opsize, addrsize, lock;
@@ -84,6 +86,7 @@ typedef struct Dec {
     int base, index, scale;
     int64_t disp;
     bool riprel;
+    bool addr16;            // a 16-bit memory operand (32-bit mode with 67): unsupported
     uint64_t off, ea;       // offset without and with the segment base
 } Dec;
 
@@ -105,6 +108,7 @@ static void modrm(Dec *d)
         return;
     }
     d->mem = true;
+    d->addr16 = d->m32 && d->addrsize;
     d->base = -1;
     d->index = -1;
     d->scale = 0;
@@ -119,7 +123,7 @@ static void modrm(Dec *d)
         else
             d->base = (sib & 7) | ((d->rex & 1) << 3);
     } else if (d->rmf == 5 && d->mod == 0) {
-        d->riprel = true;
+        d->riprel = !d->m32;   // 32-bit mode: an absolute disp32
         d->disp = (int32_t)fetch32(d);
     } else {
         d->base = d->rmf | ((d->rex & 1) << 3);
@@ -132,16 +136,18 @@ static void modrm(Dec *d)
 static bool finish(const X64State *s, Dec *d)
 {
     size_t length = (size_t)(d->p - d->begin);
-    if (length > 15) return false;
+    if (length > 15 || d->addr16) return false;
     d->next = d->start + length;
+    if (d->m32) d->next = (uint32_t)d->next;
     if (d->mem) {
         uint64_t off = (uint64_t)d->disp;
         if (d->riprel) off += d->next;
         if (d->base >= 0) off += s->gpr[d->base];
         if (d->index >= 0) off += s->gpr[d->index] << d->scale;
-        if (d->addrsize) off &= 0xffffffffull;
+        if (d->addrsize || d->m32) off &= 0xffffffffull;
         d->off = off;
-        d->ea = off + (d->seg == 4 ? s->fs_base : d->seg == 5 ? s->gs_base : 0);
+        uint64_t a = off + (d->seg == 4 ? s->fs_base : d->seg == 5 ? s->gs_base : 0);
+        d->ea = d->m32 ? d->gbase + (uint32_t)a : a;
     }
     return true;
 }
@@ -152,6 +158,15 @@ static inline int osz(const Dec *d) { return (d->rex & 8) ? 8 : d->opsize ? 2 : 
 // Registers and memory
 
 static inline uint64_t mask_of(int size) { return size == 8 ? ~0ull : (1ull << (size * 8)) - 1; }
+
+// Guest address to host address, and the width of addresses and of EIP.
+static inline uint64_t ha(const X64State *s, uint64_t guest)
+{
+    return s->mode32 ? s->guest_base + (uint32_t)guest : guest;
+}
+static inline uint64_t ipm(const X64State *s, uint64_t v) { return s->mode32 ? (uint32_t)v : v; }
+// PUSH and POP's operand size: 64 bits (32 in 32-bit mode), 16 with 66.
+static inline int stack_size(const X64State *s, const Dec *d) { return d->opsize ? 2 : s->mode32 ? 4 : 8; }
 static inline uint64_t sign_of(int size) { return 1ull << (size * 8 - 1); }
 
 static inline int64_t sext(uint64_t v, int size)
@@ -282,16 +297,18 @@ static inline void set_rm(X64State *s, const Dec *d, int size, uint64_t v)
     else set_reg(s, d, d->rm, size, v);
 }
 
+// The store comes first, so a fault leaves RSP as it was.
 static inline void push(X64State *s, uint64_t v, int size)
 {
-    s->gpr[X64_RSP] -= (uint64_t)size;
-    mem_write(s->gpr[X64_RSP], size, v);
+    uint64_t sp = ipm(s, s->gpr[X64_RSP] - (uint64_t)size);
+    mem_write(ha(s, sp), size, v);
+    s->gpr[X64_RSP] = sp;
 }
 
 static inline uint64_t pop(X64State *s, int size)
 {
-    uint64_t v = mem_read(s->gpr[X64_RSP], size);
-    s->gpr[X64_RSP] += (uint64_t)size;
+    uint64_t v = mem_read(ha(s, s->gpr[X64_RSP]), size);
+    s->gpr[X64_RSP] = ipm(s, s->gpr[X64_RSP] + (uint64_t)size);
     return v;
 }
 
@@ -778,6 +795,12 @@ static inline X64Vec xm(const X64State *s, const Dec *d, int bytes)
     return v;
 }
 
+static int mmx(X64State *s, Dec *d, uint8_t op);
+static inline uint64_t mm_get(const X64State *s, int i) { return s->st[i & 7].mantissa; }
+static inline void mm_set(X64State *s, int i, uint64_t v) { s->st[i & 7].mantissa = v; s->st[i & 7].exponent = 0xffff; }
+// Any MMX instruction but EMMS: TOP 0 and every register in use.
+static inline void mmx_enter(X64State *s) { s->fsw &= (uint16_t)~0x3800; s->ftw = 0xff; }
+
 static int sse(X64State *s, Dec *d, int map, uint8_t op)
 {
     // The mandatory prefix: 0 none, 1 66, 2 F3, 3 F2 (F2/F3 win over 66).
@@ -788,7 +811,7 @@ static int sse(X64State *s, Dec *d, int map, uint8_t op)
     if (map == 2) {
         if (op != 0x00 || pfx != 1) return X64_EXIT_UNSUPPORTED;
         modrm(d);
-        if (!finish(s, d)) return X64_EXIT_ILLEGAL;
+        if (!finish(s, d)) return d->addr16 ? X64_EXIT_UNSUPPORTED : X64_EXIT_ILLEGAL;
         s->rip = d->next;
         X64Vec b = xm(s, d, 16), *a = &s->xmm[d->reg], r = {{0}};
         for (i = 0; i < 16; i++) r.b[i] = (b.b[i] & 0x80) ? 0 : a->b[b.b[i] & 15];   // PSHUFB
@@ -799,7 +822,7 @@ static int sse(X64State *s, Dec *d, int map, uint8_t op)
         if (op != 0x0F || pfx != 1) return X64_EXIT_UNSUPPORTED;
         modrm(d);
         imm = fetch8(d);
-        if (!finish(s, d)) return X64_EXIT_ILLEGAL;
+        if (!finish(s, d)) return d->addr16 ? X64_EXIT_UNSUPPORTED : X64_EXIT_ILLEGAL;
         s->rip = d->next;
         X64Vec b = xm(s, d, 16), *a = &s->xmm[d->reg], r = {{0}};   // PALIGNR
         uint8_t cat[32];
@@ -810,14 +833,14 @@ static int sse(X64State *s, Dec *d, int map, uint8_t op)
         return CONT;
     }
 
-    // Opcodes whose 66-less form is MMX (or that need a prefix to exist at all).
+    // Opcodes whose 66-less form is MMX.
     bool sse_int = (op >= 0x60 && op <= 0x7F) || op >= 0xD0 || op == 0xC4 || op == 0xC5;
-    if (sse_int && pfx == 0) return X64_EXIT_UNSUPPORTED;
+    if (sse_int && pfx == 0) return mmx(s, d, op);
 
     modrm(d);
     if (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 || op == 0xC2 || op == 0xC4 || op == 0xC5 || op == 0xC6)
         imm = fetch8(d);
-    if (!finish(s, d)) return X64_EXIT_ILLEGAL;
+    if (!finish(s, d)) return d->addr16 ? X64_EXIT_UNSUPPORTED : X64_EXIT_ILLEGAL;
     s->rip = d->next;
 
     X64Vec *a = &s->xmm[d->reg];
@@ -873,16 +896,34 @@ static int sse(X64State *s, Dec *d, int map, uint8_t op)
         if (pfx > 1 || (op == 0x2B && !d->mem)) return X64_EXIT_ILLEGAL;
         if (d->mem) vec_write(d->ea, a, 16); else s->xmm[d->rm] = *a;
         return CONT;
-    case 0x2A: { // CVTSI2SS CVTSI2SD
-        if (pfx < 2) return X64_EXIT_UNSUPPORTED;   // CVTPI2PS/PD take MMX
+    case 0x2A: { // CVTSI2SS CVTSI2SD; CVTPI2PS CVTPI2PD
+        if (pfx < 2) {
+            uint64_t src = d->mem ? mem_read(d->ea, 8) : mm_get(s, d->rmf);
+            if (!d->mem) mmx_enter(s);
+            int32_t lo = (int32_t)src, hi = (int32_t)(src >> 32);
+            if (pfx == 0) {
+                volatile float f0 = (float)lo, f1 = (float)hi;
+                a->d[0] = f2u(f0); a->d[1] = f2u(f1);
+            } else {
+                a->q[0] = d2u((double)lo); a->q[1] = d2u((double)hi);
+            }
+            return CONT;
+        }
         int size = (d->rex & 8) ? 8 : 4;
         int64_t v = sext(get_rm(s, d, size), size);
         if (pfx == 2) { volatile float f = (float)v; a->d[0] = f2u(f); }
         else { volatile double f = (double)v; a->q[0] = d2u(f); }
         return CONT;
     }
-    case 0x2C: case 0x2D: { // CVTTSS2SI CVTSS2SI CVTTSD2SI CVTSD2SI
-        if (pfx < 2) return X64_EXIT_UNSUPPORTED;
+    case 0x2C: case 0x2D: { // CVTTSS2SI CVTSS2SI CVTTSD2SI CVTSD2SI; CVT(T)PS2PI CVT(T)PD2PI
+        if (pfx < 2) {
+            double v0, v1;
+            if (pfx == 0) { b = xm(s, d, 8); v0 = u2f(f32_in(s, b.d[0])); v1 = u2f(f32_in(s, b.d[1])); }
+            else { b = xm(s, d, 16); v0 = u2d(f64_in(s, b.q[0])); v1 = u2d(f64_in(s, b.q[1])); }
+            mmx_enter(s);
+            mm_set(s, d->regf, (uint32_t)f_to_int(v0, op == 0x2C, 4) | ((uint64_t)(uint32_t)f_to_int(v1, op == 0x2C, 4) << 32));
+            return CONT;
+        }
         int size = (d->rex & 8) ? 8 : 4;
         double v;
         if (pfx == 2) { b = xm(s, d, 4); v = u2f(f32_in(s, b.d[0])); }
@@ -1050,8 +1091,14 @@ static int sse(X64State *s, Dec *d, int map, uint8_t op)
         else if (pfx == 3) for (i = 0; i < 4; i++) a->d[i] = f32_op(s, (i & 1) ? FOP_ADD : FOP_SUB, a->d[i], b.d[i]);
         else return X64_EXIT_ILLEGAL;
         return CONT;
-    case 0xD6: // MOVQ xmm/m64, xmm
-        if (pfx != 1) return X64_EXIT_UNSUPPORTED;   // MOVQ2DQ/MOVDQ2Q are MMX
+    case 0xD6: // MOVQ xmm/m64, xmm; MOVQ2DQ; MOVDQ2Q
+        if (pfx >= 2) {
+            if (d->mem) return X64_EXIT_ILLEGAL;
+            mmx_enter(s);
+            if (pfx == 2) { a->q[0] = mm_get(s, d->rmf); a->q[1] = 0; }
+            else mm_set(s, d->regf, s->xmm[d->rm].q[0]);
+            return CONT;
+        }
         if (d->mem) vec_write(d->ea, a, 8);
         else { s->xmm[d->rm].q[0] = a->q[0]; s->xmm[d->rm].q[1] = 0; }
         return CONT;
@@ -1084,9 +1131,10 @@ static int sse(X64State *s, Dec *d, int map, uint8_t op)
         return CONT;
     case 0xF7: { // MASKMOVDQU
         if (pfx != 1 || d->mem) return X64_EXIT_ILLEGAL;
-        uint64_t base = (d->addrsize ? s->gpr[X64_RDI] & 0xffffffffull : s->gpr[X64_RDI]) + seg_base(s, d);
+        if (d->m32 && d->addrsize) return X64_EXIT_UNSUPPORTED;   // DI
+        uint64_t base = (d->addrsize || d->m32 ? s->gpr[X64_RDI] & 0xffffffffull : s->gpr[X64_RDI]) + seg_base(s, d);
         for (i = 0; i < 16; i++)
-            if (s->xmm[d->rm].b[i] & 0x80) mem_write(base + (uint64_t)i, 1, a->b[i]);
+            if (s->xmm[d->rm].b[i] & 0x80) mem_write(ha(s, base + (uint64_t)i), 1, a->b[i]);
         return CONT;
     }
     }
@@ -1100,10 +1148,18 @@ static int sse(X64State *s, Dec *d, int map, uint8_t op)
 // ---------------------------------------------------------------------------
 // String instructions
 
+// A string instruction's operand: the register as wide as the address size, plus
+// the segment base, as a host address.
+static inline uint64_t str_addr(const X64State *s, uint64_t reg, uint64_t amask, uint64_t segbase)
+{
+    uint64_t a = (reg & amask) + segbase;
+    return s->mode32 ? s->guest_base + (uint32_t)a : a;
+}
+
 static int string_op(X64State *s, Dec *d, uint8_t op)
 {
     int size = (op & 1) ? osz(d) : 1;
-    bool a32 = d->addrsize;
+    bool a32 = d->addrsize || s->mode32;
     uint64_t amask = a32 ? 0xffffffffull : ~0ull;
     int asize = a32 ? 4 : 8;
     int64_t step = (s->rflags & FL_DF) ? -size : size;
@@ -1112,12 +1168,15 @@ static int string_op(X64State *s, Dec *d, uint8_t op)
     uint64_t count = rep ? s->gpr[X64_RCX] & amask : 1;
     uint64_t rsi = s->gpr[X64_RSI] & amask, rdi = s->gpr[X64_RDI] & amask;
     uint64_t done = 0;
+    // A forward REP over a range that does not wrap the address size: one memmove or memset.
+    uint64_t bytes = count * (uint64_t)size;
+    bool linear = rep && step > 0 && count && (!a32 || (s->mode32 && ((rsi + src_base) & amask) + bytes <= 0x100000000ull
+                                                       && rdi + bytes <= 0x100000000ull));
 
     switch (op) {
     case 0xA4: case 0xA5: { // MOVS
-        uint64_t bytes = count * (uint64_t)size;
-        uint64_t src = rsi + src_base, dst = rdi;
-        if (rep && step > 0 && !a32 && count && (dst <= src || dst >= src + bytes)) {
+        uint64_t src = str_addr(s, rsi, amask, src_base), dst = str_addr(s, rdi, amask, 0);
+        if (linear && (dst <= src || dst >= src + bytes)) {
 #if X64_INTERP_TSO
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
@@ -1128,7 +1187,7 @@ static int string_op(X64State *s, Dec *d, uint8_t op)
             rsi += bytes; rdi += bytes; done = count;
         } else {
             for (; done < count; done++) {
-                mem_write(rdi, size, mem_read((rsi & amask) + src_base, size));
+                mem_write(str_addr(s, rdi, amask, 0), size, mem_read(str_addr(s, rsi, amask, src_base), size));
                 rsi = (rsi + (uint64_t)step) & amask;
                 rdi = (rdi + (uint64_t)step) & amask;
             }
@@ -1137,12 +1196,12 @@ static int string_op(X64State *s, Dec *d, uint8_t op)
     }
     case 0xAA: case 0xAB: { // STOS
         uint64_t v = s->gpr[X64_RAX] & mask_of(size);
-        if (rep && step > 0 && !a32 && size == 1 && count) {
-            memset((void *)(uintptr_t)rdi, (int)v, (size_t)count);
+        if (linear && size == 1) {
+            memset((void *)(uintptr_t)str_addr(s, rdi, amask, 0), (int)v, (size_t)count);
             rdi += count; done = count;
         } else {
             for (; done < count; done++) {
-                mem_write(rdi, size, v);
+                mem_write(str_addr(s, rdi, amask, 0), size, v);
                 rdi = (rdi + (uint64_t)step) & amask;
             }
         }
@@ -1150,7 +1209,7 @@ static int string_op(X64State *s, Dec *d, uint8_t op)
     }
     case 0xAC: case 0xAD: // LODS
         for (; done < count; done++) {
-            set_reg(s, d, X64_RAX, size, mem_read(rsi + src_base, size));
+            set_reg(s, d, X64_RAX, size, mem_read(str_addr(s, rsi, amask, src_base), size));
             rsi = (rsi + (uint64_t)step) & amask;
         }
         break;
@@ -1158,12 +1217,12 @@ static int string_op(X64State *s, Dec *d, uint8_t op)
         while (done < count) {
             uint64_t a, b;
             if (op <= 0xA7) {
-                a = mem_read(rsi + src_base, size);
-                b = mem_read(rdi, size);
+                a = mem_read(str_addr(s, rsi, amask, src_base), size);
+                b = mem_read(str_addr(s, rdi, amask, 0), size);
                 rsi = (rsi + (uint64_t)step) & amask;
             } else {
                 a = s->gpr[X64_RAX];
-                b = mem_read(rdi, size);
+                b = mem_read(str_addr(s, rdi, amask, 0), size);
             }
             rdi = (rdi + (uint64_t)step) & amask;
             op_sub(s, a, b, 0, size);
@@ -1189,13 +1248,13 @@ static inline bool native(const X64Env *env, uint64_t target)
 
 static int jump(X64State *s, const X64Env *env, uint64_t target)
 {
-    s->rip = target;
-    return native(env, target) ? X64_EXIT_NATIVE : CONT;
+    s->rip = ipm(s, target);
+    return native(env, s->rip) ? X64_EXIT_NATIVE : CONT;
 }
 
 static int call(X64State *s, const X64Env *env, uint64_t target, uint64_t ret)
 {
-    push(s, ret, 8);
+    push(s, ret, s->mode32 ? 4 : 8);
     return jump(s, env, target);
 }
 
@@ -1206,31 +1265,53 @@ static uint64_t rdtsc(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-// FXSAVE's 512-byte area: control and status words, MXCSR, the x87 registers
-// (zero: no x87 arithmetic here) and the XMM registers. Bytes 416-511 are left
-// alone, as x86 leaves 464-511 to software.
-static void fxsave(const X64State *s, uint64_t addr)
+// FXSAVE's 512-byte area: control and status words, the abridged tag byte,
+// MXCSR, the x87 registers in stack order and the XMM registers (8 of them in
+// 32-bit mode). Bytes 416-511 are left alone, as x86 leaves 464-511 to software.
+// The instruction and operand pointers are not tracked and are stored as zero.
+static void fx_store(const X64State *s, uint8_t *area)
 {
-    uint8_t area[416];
-    memset(area, 0, sizeof area);
+    memset(area, 0, 416);
     memcpy(area + 0, &s->fcw, 2);
     memcpy(area + 2, &s->fsw, 2);
+    area[4] = s->ftw;
     memcpy(area + 24, &s->mxcsr, 4);
     uint32_t mask = 0xffff;
     memcpy(area + 28, &mask, 4);
-    memcpy(area + 160, s->xmm, sizeof s->xmm);
+    int top = (s->fsw >> 11) & 7;
+    for (int i = 0; i < 8; i++) memcpy(area + 32 + 16 * i, &s->st[(top + i) & 7], 10);
+    memcpy(area + 160, s->xmm, s->mode32 ? 8 * sizeof s->xmm[0] : sizeof s->xmm);
+}
+
+static void fx_load(X64State *s, const uint8_t *area)
+{
+    memcpy(&s->fcw, area + 0, 2);
+    memcpy(&s->fsw, area + 2, 2);
+    s->ftw = area[4];
+    memcpy(&s->mxcsr, area + 24, 4);
+    s->mxcsr &= 0xffff;
+    int top = (s->fsw >> 11) & 7;
+    for (int i = 0; i < 8; i++) {
+        X87Reg *r = &s->st[(top + i) & 7];
+        memcpy(r, area + 32 + 16 * i, 10);
+        r->pad[0] = r->pad[1] = r->pad[2] = 0;
+    }
+    memcpy(s->xmm, area + 160, s->mode32 ? 8 * sizeof s->xmm[0] : sizeof s->xmm);
+}
+
+static void fxsave(const X64State *s, uint64_t addr)
+{
+    uint8_t area[416];
+    fx_store(s, area);
     memcpy((void *)(uintptr_t)addr, area, sizeof area);
 }
 
 static void fxrstor(X64State *s, uint64_t addr)
 {
-    const uint8_t *area = (const uint8_t *)(uintptr_t)addr;
-    uint32_t mxcsr;
-    memcpy(&s->fcw, area + 0, 2);
-    memcpy(&s->fsw, area + 2, 2);
-    memcpy(&mxcsr, area + 24, 4);
-    memcpy(s->xmm, area + 160, sizeof s->xmm);
-    set_mxcsr(s, mxcsr);
+    uint8_t area[416];
+    memcpy(area, (const void *)(uintptr_t)addr, sizeof area);
+    fx_load(s, area);
+    set_mxcsr(s, s->mxcsr);
 }
 
 // The opcodes LOCK may precede (with a memory destination, checked where decoded).
@@ -1245,9 +1326,796 @@ static bool lockable(int map, uint8_t op)
                         op == 0xB1 || op == 0xC0 || op == 0xC1 || op == 0xC7);
 }
 
-#define FIN() do { if (!finish(s, d)) return X64_EXIT_ILLEGAL; s->rip = d->next; } while (0)
+#define FIN() do { if (!finish(s, d)) return d->addr16 ? X64_EXIT_UNSUPPORTED : X64_EXIT_ILLEGAL; s->rip = d->next; } while (0)
 #define NEED_MEM() do { if (!d->mem) return X64_EXIT_ILLEGAL; } while (0)
 #define LOCK_MEM() do { if (d->lock && !d->mem) return X64_EXIT_ILLEGAL; } while (0)
+
+// ---------------------------------------------------------------------------
+// x87 and MMX
+//
+// Registers keep all 80 bits through loads, stores, moves, integer
+// conversions and comparisons. Arithmetic converts to double, which matches
+// Windows' default precision control (53-bit, control word 0x27F) for values in
+// double's range; transcendental results are double's. Rounding follows the
+// control word's RC; exceptions are not raised and their flags are not set.
+
+#define FSW_C0 0x0100
+#define FSW_C1 0x0200
+#define FSW_C2 0x0400
+#define FSW_C3 0x4000
+#define FSW_CC (FSW_C0 | FSW_C1 | FSW_C2 | FSW_C3)
+
+static const X87Reg F80_INDEFINITE = { 0xc000000000000000ull, 0xffff, { 0, 0, 0 } };
+static const X87Reg F80_ONE = { 0x8000000000000000ull, 0x3fff, { 0, 0, 0 } };
+
+static inline int x87_top(const X64State *s) { return (s->fsw >> 11) & 7; }
+static inline void x87_set_top(X64State *s, int top) { s->fsw = (uint16_t)((s->fsw & ~0x3800) | ((top & 7) << 11)); }
+static inline X87Reg *x87_st(X64State *s, int i) { return &s->st[(x87_top(s) + i) & 7]; }
+static inline void x87_set_cc(X64State *s, uint16_t cc) { s->fsw = (uint16_t)((s->fsw & ~FSW_CC) | cc); }
+
+// A push onto a register still in use is a (masked) stack overflow: the
+// indefinite NaN is pushed instead.
+static inline void x87_push(X64State *s, X87Reg v)
+{
+    int t = (x87_top(s) - 1) & 7;
+    x87_set_top(s, t);
+    s->st[t] = (s->ftw & (1 << t)) ? F80_INDEFINITE : v;
+    s->ftw |= (uint8_t)(1 << t);
+}
+
+static inline bool x87_valid(const X64State *s, int i) { return (s->ftw >> ((x87_top(s) + i) & 7)) & 1; }
+
+// Reading an empty register is a (masked) stack underflow: the operand is the
+// indefinite NaN.
+static inline X87Reg x87_get(X64State *s, int i) { return x87_valid(s, i) ? *x87_st(s, i) : F80_INDEFINITE; }
+
+static inline void x87_put(X64State *s, int i, X87Reg v)
+{
+    int p = (x87_top(s) + i) & 7;
+    s->st[p] = v;
+    s->ftw |= (uint8_t)(1 << p);
+}
+
+static inline void x87_pop(X64State *s)
+{
+    int t = x87_top(s);
+    s->ftw &= (uint8_t)~(1 << t);
+    x87_set_top(s, t + 1);
+}
+
+static inline bool f80_nan(X87Reg v) { return (v.exponent & 0x7fff) == 0x7fff && (v.mantissa << 1); }
+static inline bool f80_neg(X87Reg v) { return (v.exponent & 0x8000) != 0; }
+static inline X87Reg f80_quiet(X87Reg v) { v.mantissa |= 0x4000000000000000ull; return v; }
+
+// Exact multiplication by 2^k within double's range, in steps outside it.
+static double scale2(double m, int k)
+{
+    while (k > 1000) { m *= 0x1p1000; k -= 1000; if (isinf(m)) return m; }
+    while (k < -1000) { m *= 0x1p-1000; k += 1000; if (m == 0) return m; }
+    return m * u2d((uint64_t)(k + 1023) << 52);
+}
+
+static X87Reg f80_from_f64(uint64_t bits)
+{
+    X87Reg r = { 0, 0, { 0, 0, 0 } };
+    uint16_t sign = (uint16_t)((bits >> 48) & 0x8000);
+    int e = (int)((bits >> 52) & 0x7ff);
+    uint64_t frac = bits & 0x000fffffffffffffull;
+    if (e == 0x7ff) { r.exponent = sign | 0x7fff; r.mantissa = 0x8000000000000000ull | (frac << 11); }
+    else if (e) { r.exponent = (uint16_t)(sign | (e - 1023 + 16383)); r.mantissa = 0x8000000000000000ull | (frac << 11); }
+    else if (frac) { int lz = __builtin_clzll(frac); r.mantissa = frac << lz; r.exponent = (uint16_t)(sign | (15372 - lz)); }
+    else r.exponent = sign;
+    return r;
+}
+
+static X87Reg f80_from_f32(uint32_t bits)
+{
+    X87Reg r = { 0, 0, { 0, 0, 0 } };
+    uint16_t sign = (uint16_t)((bits >> 16) & 0x8000);
+    int e = (int)((bits >> 23) & 0xff);
+    uint64_t frac = bits & 0x007fffffu;
+    if (e == 0xff) { r.exponent = sign | 0x7fff; r.mantissa = 0x8000000000000000ull | (frac << 40); }
+    else if (e) { r.exponent = (uint16_t)(sign | (e - 127 + 16383)); r.mantissa = 0x8000000000000000ull | (frac << 40); }
+    else if (frac) { int lz = __builtin_clzll(frac); r.mantissa = frac << lz; r.exponent = (uint16_t)(sign | (16297 - lz)); }
+    else r.exponent = sign;
+    return r;
+}
+
+static X87Reg f80_from_magnitude(bool neg, uint64_t m)
+{
+    X87Reg r = { 0, (uint16_t)(neg ? 0x8000 : 0), { 0, 0, 0 } };
+    if (!m) return r;
+    int lz = __builtin_clzll(m);
+    r.mantissa = m << lz;
+    r.exponent = (uint16_t)(r.exponent | (16383 + 63 - lz));
+    return r;
+}
+
+static X87Reg f80_from_int(int64_t i)
+{
+    return f80_from_magnitude(i < 0, i < 0 ? 0 - (uint64_t)i : (uint64_t)i);
+}
+
+// The significand with a sticky bit, signed: one rounding to 53 or 24 bits in
+// the right direction for the sign.
+static inline int64_t f80_signed_half(X87Reg v)
+{
+    uint64_t half = (v.mantissa >> 1) | (v.mantissa & 1);
+    return f80_neg(v) ? -(int64_t)half : (int64_t)half;
+}
+
+static double f80_to_double(X87Reg v)
+{
+    int e = v.exponent & 0x7fff;
+    if (e == 0x7fff) {
+        if (!(v.mantissa << 1)) return f80_neg(v) ? -INFINITY : INFINITY;
+        return u2d((f80_neg(v) ? 0x8000000000000000ull : 0) | 0x7ff8000000000000ull | ((v.mantissa >> 11) & 0x0007ffffffffffffull));
+    }
+    if (!v.mantissa) return f80_neg(v) ? -0.0 : 0.0;
+    volatile double m = (double)f80_signed_half(v);
+    return scale2(m, (e ? e : 1) - 16383 - 62);
+}
+
+static uint32_t f80_to_f32(X87Reg v)
+{
+    int e = v.exponent & 0x7fff;
+    uint32_t sign = f80_neg(v) ? 0x80000000u : 0;
+    if (e == 0x7fff) {
+        if (!(v.mantissa << 1)) return sign | 0x7f800000u;
+        return sign | 0x7fc00000u | (uint32_t)((v.mantissa >> 40) & 0x3fffff);
+    }
+    if (!v.mantissa) return sign;
+    volatile float m = (float)f80_signed_half(v);
+    volatile double r = scale2((double)m, (e ? e : 1) - 16383 - 62);
+    volatile float f = (float)r;
+    return f2u(f);
+}
+
+// Rounds the magnitude to an integer: rc 0 nearest even, 1 down, 2 up, 3 toward
+// zero. False when it does not fit in 64 bits (or for a NaN or infinity).
+static bool f80_round(X87Reg v, int rc, uint64_t *magnitude)
+{
+    int e = v.exponent & 0x7fff;
+    bool neg = f80_neg(v);
+    if (e == 0x7fff) return false;
+    if (!v.mantissa) { *magnitude = 0; return true; }
+    int ue = (e ? e : 1) - 16383;   // value = mantissa * 2^(ue - 63)
+    if (ue >= 63) {
+        if (ue > 63) return false;
+        *magnitude = v.mantissa;     // 2^63 to 2^64 - 1, already an integer
+        return true;
+    }
+    uint64_t ip, frac;               // integer part, fraction left-aligned
+    if (ue >= 0) {
+        ip = v.mantissa >> (63 - ue);
+        frac = v.mantissa << (ue + 1);
+    } else {
+        int shift = -ue - 1;   // the value is mantissa * 2^(ue + 1) / 2^64: below 1
+        ip = 0;
+        frac = shift == 0 ? v.mantissa : shift >= 64 ? 1 : (v.mantissa >> shift) | ((v.mantissa << (64 - shift)) != 0);
+    }
+    bool up;
+    switch (rc & 3) {
+    case 0: up = frac > 0x8000000000000000ull || (frac == 0x8000000000000000ull && (ip & 1)); break;
+    case 1: up = neg && frac; break;
+    case 2: up = !neg && frac; break;
+    default: up = false; break;
+    }
+    *magnitude = ip + up;
+    return true;
+}
+
+static bool f80_to_int(X87Reg v, int rc, int64_t *out)
+{
+    uint64_t m;
+    if (!f80_round(v, rc, &m)) return false;
+    if (f80_neg(v)) {
+        if (m > 0x8000000000000000ull) return false;
+        *out = (int64_t)(0 - m);
+    } else {
+        if (m > 0x7fffffffffffffffull) return false;
+        *out = (int64_t)m;
+    }
+    return true;
+}
+
+// -1 less, 0 equal, 1 greater, 2 unordered; exact on all 80 bits.
+static int f80_cmp(X87Reg a, X87Reg b)
+{
+    if (f80_nan(a) || f80_nan(b)) return 2;
+    bool az = !a.mantissa, bz = !b.mantissa;
+    bool an = f80_neg(a), bn = f80_neg(b);
+    if (az && bz) return 0;
+    if (az) return bn ? 1 : -1;
+    if (bz) return an ? -1 : 1;
+    if (an != bn) return an ? -1 : 1;
+    int ea = a.exponent & 0x7fff, eb = b.exponent & 0x7fff;
+    int m = ea != eb ? (ea < eb ? -1 : 1) : a.mantissa != b.mantissa ? (a.mantissa < b.mantissa ? -1 : 1) : 0;
+    return an ? -m : m;
+}
+
+enum { X87_ADD, X87_MUL, X87_COM, X87_COMP, X87_SUB, X87_SUBR, X87_DIV, X87_DIVR };
+
+// `a` is the destination: SUB is a - b, SUBR b - a.
+static X87Reg f80_arith(int op, X87Reg a, X87Reg b)
+{
+    bool na = f80_nan(a), nb = f80_nan(b);
+    if (na || nb) {
+        if (na && nb) {
+            bool qa = (a.mantissa >> 62) & 1, qb = (b.mantissa >> 62) & 1;
+            if (qa != qb) return qa ? a : b;   // a QNaN over an SNaN
+            return f80_quiet((a.mantissa << 1) >= (b.mantissa << 1) ? a : b);
+        }
+        return f80_quiet(na ? a : b);
+    }
+    double x = f80_to_double(a), y = f80_to_double(b);
+    volatile double r;
+    switch (op) {
+    case X87_ADD: r = x + y; break;
+    case X87_MUL: r = x * y; break;
+    case X87_SUB: r = x - y; break;
+    case X87_SUBR: r = y - x; break;
+    case X87_DIV: r = x / y; break;
+    default: r = y / x; break;
+    }
+    uint64_t bits = d2u(r);
+    return f64_nan(bits) ? F80_INDEFINITE : f80_from_f64(bits);
+}
+
+static X87Reg f80_from_double(double r)
+{
+    uint64_t bits = d2u(r);
+    return f64_nan(bits) ? F80_INDEFINITE : f80_from_f64(bits);
+}
+
+static void x87_compare(X64State *s, X87Reg a, X87Reg b, bool eflags)
+{
+    int c = f80_cmp(a, b);
+    if (eflags) {
+        set_flags(s, FL_ARITH, c == 2 ? FL_ZF | FL_PF | FL_CF : c < 0 ? FL_CF : c == 0 ? FL_ZF : 0);
+        s->fsw &= (uint16_t)~FSW_C1;
+    } else {
+        x87_set_cc(s, c == 2 ? FSW_C3 | FSW_C2 | FSW_C0 : c < 0 ? FSW_C0 : c == 0 ? FSW_C3 : 0);
+    }
+}
+
+// The full two-bit tag word FSTENV and FSAVE store.
+static uint16_t x87_full_tags(const X64State *s)
+{
+    uint16_t tags = 0;
+    for (int i = 0; i < 8; i++) {
+        unsigned tag;
+        const X87Reg *r = &s->st[i];
+        int e = r->exponent & 0x7fff;
+        if (!(s->ftw & (1 << i))) tag = 3;
+        else if (e == 0x7fff) tag = 2;
+        else if (!e) tag = r->mantissa ? 2 : 1;
+        else tag = (r->mantissa >> 63) ? 0 : 2;
+        tags |= (uint16_t)(tag << (2 * i));
+    }
+    return tags;
+}
+
+// FSTENV's 28-byte protected-mode image. The instruction and operand pointers
+// are not tracked and are stored as zero.
+static void x87_store_env(X64State *s, uint64_t addr)
+{
+    uint32_t env[7] = { 0xffff0000u | s->fcw, 0xffff0000u | s->fsw, 0xffff0000u | x87_full_tags(s), 0, 0, 0, 0xffff0000u };
+    memcpy((void *)(uintptr_t)addr, env, sizeof env);
+}
+
+static void x87_load_env(X64State *s, uint64_t addr)
+{
+    uint32_t env[7];
+    memcpy(env, (const void *)(uintptr_t)addr, sizeof env);
+    s->fcw = (uint16_t)env[0];
+    s->fsw = (uint16_t)env[1];
+    s->ftw = 0;
+    for (int i = 0; i < 8; i++)
+        if (((env[2] >> (2 * i)) & 3) != 3) s->ftw |= (uint8_t)(1 << i);
+}
+
+static void x87_init(X64State *s)
+{
+    s->fcw = 0x37f;
+    s->fsw = 0;
+    s->ftw = 0;
+}
+
+// The constants, rounded as RC asks: { nearest, down/toward zero, up } significands.
+static X87Reg x87_constant(const X64State *s, int which)
+{
+    static const struct { uint16_t exponent; uint64_t near, down, up; } k[] = {
+        { 0x4000, 0xd49a784bcd1b8afeull, 0xd49a784bcd1b8afeull, 0xd49a784bcd1b8affull },   // log2(10)
+        { 0x3fff, 0xb8aa3b295c17f0bcull, 0xb8aa3b295c17f0bbull, 0xb8aa3b295c17f0bcull },   // log2(e)
+        { 0x4000, 0xc90fdaa22168c235ull, 0xc90fdaa22168c234ull, 0xc90fdaa22168c235ull },   // pi
+        { 0x3ffd, 0x9a209a84fbcff799ull, 0x9a209a84fbcff798ull, 0x9a209a84fbcff799ull },   // log10(2)
+        { 0x3ffe, 0xb17217f7d1cf79acull, 0xb17217f7d1cf79abull, 0xb17217f7d1cf79acull },   // ln(2)
+    };
+    int rc = (s->fcw >> 10) & 3;
+    X87Reg r = { rc == 0 ? k[which].near : rc == 2 ? k[which].up : k[which].down, k[which].exponent, { 0, 0, 0 } };
+    return r;
+}
+
+static X87Reg x87_load_bcd(uint64_t addr)
+{
+    uint8_t b[10];
+    memcpy(b, (const void *)(uintptr_t)addr, 10);
+    uint64_t v = 0;
+    for (int i = 8; i >= 0; i--) v = v * 100 + (uint64_t)(b[i] >> 4) * 10 + (b[i] & 15);
+    return f80_from_magnitude((b[9] & 0x80) != 0, v);
+}
+
+static void x87_store_bcd(const X64State *s, uint64_t addr, X87Reg v)
+{
+    uint8_t b[10] = { 0 };
+    uint64_t m;
+    if (!f80_round(v, (s->fcw >> 10) & 3, &m) || m > 999999999999999999ull) {
+        b[7] = 0xc0; b[8] = 0xff; b[9] = 0xff;   // the packed BCD indefinite
+    } else {
+        for (int i = 0; i < 9; i++) { b[i] = (uint8_t)((m % 10) | ((m / 10 % 10) << 4)); m /= 100; }
+        if (f80_neg(v)) b[9] = 0x80;
+    }
+    memcpy((void *)(uintptr_t)addr, b, 10);
+}
+
+static const double LN2 = 0.69314718055994530942;
+
+// D9 E0-FF and the rest of the register-only one-operand group.
+static int x87_misc(X64State *s, uint8_t low)
+{
+    X87Reg a = x87_get(s, 0), b = x87_get(s, 1);
+    double x = f80_to_double(a);
+    // A NaN operand comes back quieted (two: as the arithmetic instructions choose).
+    switch (low) {
+    case 0xF0: case 0xFA: case 0xFE: case 0xFF:                               // F2XM1 FSQRT FSIN FCOS
+        if (f80_nan(a)) { x87_put(s, 0, f80_quiet(a)); if (low != 0xFA) x87_set_cc(s, 0); return CONT; }
+        break;
+    case 0xF1: case 0xF3: case 0xF9:                                          // FYL2X FPATAN FYL2XP1
+        if (f80_nan(a) || f80_nan(b)) { x87_put(s, 1, f80_arith(X87_ADD, a, b)); x87_pop(s); return CONT; }
+        break;
+    }
+    switch (low) {
+    case 0xE0: if (x87_valid(s, 0)) a.exponent ^= 0x8000; x87_put(s, 0, a); return CONT;   // FCHS
+    case 0xE1: if (x87_valid(s, 0)) a.exponent &= 0x7fff; x87_put(s, 0, a); return CONT;   // FABS
+    case 0xE4: x87_compare(s, a, (X87Reg){ 0, 0, { 0, 0, 0 } }, false); return CONT;   // FTST
+    case 0xE5: {                                                              // FXAM
+        a = *x87_st(s, 0);   // an empty register's sign is still reported
+        int e = a.exponent & 0x7fff;
+        uint16_t cc;
+        if (!(s->ftw & (1 << x87_top(s)))) cc = FSW_C3 | FSW_C0;
+        else if (e == 0x7fff) cc = !(a.mantissa >> 63) ? 0 : (a.mantissa << 1) ? FSW_C0 : FSW_C2 | FSW_C0;
+        else if (!e) cc = a.mantissa ? FSW_C3 | FSW_C2 : FSW_C3;
+        else cc = (a.mantissa >> 63) ? FSW_C2 : 0;
+        if (f80_neg(a)) cc |= FSW_C1;
+        x87_set_cc(s, cc);
+        return CONT;
+    }
+    case 0xE8: x87_push(s, F80_ONE); return CONT;                             // FLD1
+    case 0xE9: x87_push(s, x87_constant(s, 0)); return CONT;                  // FLDL2T
+    case 0xEA: x87_push(s, x87_constant(s, 1)); return CONT;                  // FLDL2E
+    case 0xEB: x87_push(s, x87_constant(s, 2)); return CONT;                  // FLDPI
+    case 0xEC: x87_push(s, x87_constant(s, 3)); return CONT;                  // FLDLG2
+    case 0xED: x87_push(s, x87_constant(s, 4)); return CONT;                  // FLDLN2
+    case 0xEE: x87_push(s, (X87Reg){ 0, 0, { 0, 0, 0 } }); return CONT;      // FLDZ
+    case 0xF0: x87_put(s, 0, f80_from_double(expm1(x * LN2))); return CONT;   // F2XM1
+    case 0xF1: x87_put(s, 1, f80_from_double(f80_to_double(b) * log2(x))); x87_pop(s); return CONT;       // FYL2X
+    case 0xF2: case 0xFE: case 0xFF: case 0xFB:                               // FPTAN FSIN FCOS FSINCOS
+        if (fabs(x) >= 0x1p63 && !isnan(x)) { x87_set_cc(s, FSW_C2); return CONT; }
+        x87_set_cc(s, 0);
+        if (low == 0xF2) { x87_put(s, 0, f80_from_double(tan(x))); x87_push(s, F80_ONE); }
+        else if (low == 0xFE) x87_put(s, 0, f80_from_double(sin(x)));
+        else if (low == 0xFF) x87_put(s, 0, f80_from_double(cos(x)));
+        else { x87_put(s, 0, f80_from_double(sin(x))); x87_push(s, f80_from_double(cos(x))); }
+        return CONT;
+    case 0xF3: x87_put(s, 1, f80_from_double(atan2(f80_to_double(b), x))); x87_pop(s); return CONT;       // FPATAN
+    case 0xF4: {                                                              // FXTRACT
+        X87Reg exp, sig = a;
+        int e = a.exponent & 0x7fff;
+        if (f80_nan(a)) { exp = sig = f80_quiet(a); }
+        else if (e == 0x7fff) { exp = a; exp.exponent &= 0x7fff; }
+        else if (!a.mantissa) exp = f80_from_double(-INFINITY);
+        else {
+            int ue = (e ? e : 1) - 16383;
+            if (!(sig.mantissa >> 63)) { int lz = __builtin_clzll(sig.mantissa); sig.mantissa <<= lz; ue -= lz; }
+            sig.exponent = (uint16_t)((a.exponent & 0x8000) | 16383);
+            exp = f80_from_int(ue);
+        }
+        x87_put(s, 0, exp);
+        x87_push(s, sig);
+        return CONT;
+    }
+    case 0xF5: case 0xF8: {                                                   // FPREM1 FPREM
+        double y = f80_to_double(b);
+        if (isnan(x) || isnan(y) || isinf(x) || y == 0) { x87_put(s, 0, isnan(x) || isnan(y) ? f80_from_double(x + y) : F80_INDEFINITE); x87_set_cc(s, 0); return CONT; }
+        double r = low == 0xF8 ? fmod(x, y) : remainder(x, y);
+        double q = fabs(nearbyint((x - r) / y));
+        unsigned bits = (unsigned)fmod(q, 8.0);
+        x87_set_cc(s, (uint16_t)(((bits & 4) ? FSW_C0 : 0) | ((bits & 2) ? FSW_C3 : 0) | ((bits & 1) ? FSW_C1 : 0)));
+        x87_put(s, 0, r == 0 ? (X87Reg){ 0, (uint16_t)(a.exponent & 0x8000), { 0, 0, 0 } } : f80_from_double(r));
+        return CONT;
+    }
+    case 0xF6: x87_set_top(s, x87_top(s) - 1); return CONT;                  // FDECSTP
+    case 0xF7: x87_set_top(s, x87_top(s) + 1); return CONT;                  // FINCSTP
+    case 0xF9: x87_put(s, 1, f80_from_double(f80_to_double(b) * log1p(x) / LN2)); x87_pop(s); return CONT;   // FYL2XP1
+    case 0xFA: x87_put(s, 0, f80_from_double(sqrt(x))); return CONT;         // FSQRT
+    case 0xFC: {                                                              // FRNDINT
+        uint64_t m;
+        int e = a.exponent & 0x7fff;
+        if (e == 0x7fff || !a.mantissa || e - 16383 >= 63) { x87_put(s, 0, f80_nan(a) ? f80_quiet(a) : a); return CONT; }
+        f80_round(a, (s->fcw >> 10) & 3, &m);
+        x87_put(s, 0, f80_from_magnitude(f80_neg(a), m));
+        return CONT;
+    }
+    case 0xFD: {                                                              // FSCALE
+        double n = trunc(f80_to_double(b));
+        int e = a.exponent & 0x7fff;
+        if (f80_nan(a) || f80_nan(b)) { x87_put(s, 0, f80_arith(X87_ADD, a, b)); return CONT; }
+        if ((!a.mantissa && isinf(n) && n > 0) || (e == 0x7fff && isinf(n) && n < 0)) { x87_put(s, 0, F80_INDEFINITE); return CONT; }   // 0 * 2^inf, inf * 2^-inf
+        if (e == 0x7fff || !a.mantissa) { x87_put(s, 0, a); return CONT; }
+        if (n > 100000) n = 100000;
+        if (n < -100000) n = -100000;
+        int ne = e + (int)n;
+        if (e && (a.mantissa >> 63) && ne >= 1 && ne <= 0x7ffe) a.exponent = (uint16_t)((a.exponent & 0x8000) | ne);
+        else a = f80_from_double(scale2(x, (int)n));
+        x87_put(s, 0, a);
+        return CONT;
+    }
+    case 0xD0: return CONT;                                                   // FNOP
+    }
+    return X64_EXIT_UNSUPPORTED;
+}
+
+static int x87(X64State *s, Dec *d, uint8_t op)
+{
+    modrm(d);
+    FIN();
+    if (d->opsize && d->mem && ((op == 0xD9 && (d->regf == 4 || d->regf == 6)) || (op == 0xDD && (d->regf == 4 || d->regf == 6))))
+        return X64_EXIT_UNSUPPORTED;   // the 16-bit environment formats
+    // Arithmetic rounds as the control word says: switch the host's mode when it
+    // differs from MXCSR's, which x64_run keeps it at.
+    int rc = (s->fcw >> 10) & 3, sse_rc = (s->mxcsr >> 13) & 3;
+    if (rc != sse_rc) fesetround(host_rounding((uint32_t)rc << 13));
+    int result = CONT;
+    int reg = d->rmf;
+    uint64_t ea = d->ea;
+    X87Reg v;
+    int64_t i64;
+
+    if (d->mem) {
+        switch ((op << 3 | d->regf) & 0x3f) {   // (op & 7) << 3 | reg
+        // D8/DC/DA/DE: ST0 = ST0 op m32fp / m64fp / m32int / m16int
+        case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
+        case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+        case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17:
+        case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: case 0x36: case 0x37:
+            switch (op) {
+            case 0xD8: v = f80_from_f32((uint32_t)mem_read(ea, 4)); break;
+            case 0xDC: v = f80_from_f64(mem_read(ea, 8)); break;
+            case 0xDA: v = f80_from_int((int32_t)mem_read(ea, 4)); break;
+            default: v = f80_from_int((int16_t)mem_read(ea, 2)); break;
+            }
+            if (d->regf == X87_COM || d->regf == X87_COMP) {
+                x87_compare(s, x87_get(s, 0), v, false);
+                if (d->regf == X87_COMP) x87_pop(s);
+            } else {
+                x87_put(s, 0, f80_arith(d->regf, x87_get(s, 0), v));
+            }
+            break;
+        case 0x08: v = f80_from_f32((uint32_t)mem_read(ea, 4)); x87_push(s, f80_nan(v) ? f80_quiet(v) : v); break;   // FLD m32
+        case 0x0A: case 0x0B: mem_write(ea, 4, f80_to_f32(x87_get(s, 0)));               // FST(P) m32
+            if (d->regf == 3) x87_pop(s);
+            break;
+        case 0x0C: x87_load_env(s, ea); break;                                             // FLDENV
+        case 0x0D: s->fcw = (uint16_t)mem_read(ea, 2); break;                              // FLDCW
+        case 0x0E: x87_store_env(s, ea); s->fcw |= 0x3f; break;                            // FNSTENV
+        case 0x0F: mem_write(ea, 2, s->fcw); break;                                        // FNSTCW
+        case 0x18: x87_push(s, f80_from_int((int32_t)mem_read(ea, 4))); break;            // FILD m32
+        case 0x19: case 0x1A: case 0x1B:                                                   // FISTTP FIST FISTP m32
+            if (!f80_to_int(x87_get(s, 0), d->regf == 1 ? 3 : rc, &i64) || i64 != (int32_t)i64) i64 = INT32_MIN;
+            mem_write(ea, 4, (uint32_t)i64);
+            if (d->regf != 2) x87_pop(s);
+            break;
+        case 0x1D: memcpy(&v, (const void *)(uintptr_t)ea, 10); v.pad[0] = v.pad[1] = v.pad[2] = 0; x87_push(s, v); break;   // FLD m80
+        case 0x1F: v = x87_get(s, 0); memcpy((void *)(uintptr_t)ea, &v, 10); x87_pop(s); break;                           // FSTP m80
+        case 0x28: v = f80_from_f64(mem_read(ea, 8)); x87_push(s, f80_nan(v) ? f80_quiet(v) : v); break;             // FLD m64
+        case 0x29: case 0x3F:                                                              // FISTTP m64 (DD /1), FISTP m64 (DF /7)
+            if (!f80_to_int(x87_get(s, 0), d->regf == 1 ? 3 : rc, &i64)) i64 = INT64_MIN;
+            mem_write(ea, 8, (uint64_t)i64);
+            x87_pop(s);
+            break;
+        case 0x39: case 0x3A: case 0x3B:                                                   // FISTTP FIST FISTP m16
+            if (!f80_to_int(x87_get(s, 0), d->regf == 1 ? 3 : rc, &i64) || i64 != (int16_t)i64) i64 = INT16_MIN;
+            mem_write(ea, 2, (uint16_t)i64);
+            if (d->regf != 2) x87_pop(s);
+            break;
+        case 0x2A: case 0x2B: mem_write(ea, 8, d2u(f80_to_double(x87_get(s, 0))));       // FST(P) m64
+            if (d->regf == 3) x87_pop(s);
+            break;
+        case 0x2C:                                                                         // FRSTOR
+            x87_load_env(s, ea);
+            for (int i = 0; i < 8; i++) {
+                memcpy(&v, (const void *)(uintptr_t)(ea + 28 + 10 * (uint64_t)i), 10);
+                v.pad[0] = v.pad[1] = v.pad[2] = 0;
+                *x87_st(s, i) = v;
+            }
+            break;
+        case 0x2E:                                                                         // FNSAVE
+            x87_store_env(s, ea);
+            for (int i = 0; i < 8; i++) memcpy((void *)(uintptr_t)(ea + 28 + 10 * (uint64_t)i), x87_st(s, i), 10);
+            x87_init(s);
+            break;
+        case 0x2F: mem_write(ea, 2, s->fsw); break;                                        // FNSTSW m16
+        case 0x38: x87_push(s, f80_from_int((int16_t)mem_read(ea, 2))); break;            // FILD m16
+        case 0x3D: x87_push(s, f80_from_int((int64_t)mem_read(ea, 8))); break;            // FILD m64
+        case 0x3C: x87_push(s, x87_load_bcd(ea)); break;                                   // FBLD
+        case 0x3E: x87_store_bcd(s, ea, x87_get(s, 0)); x87_pop(s); break;                // FBSTP
+        default: result = X64_EXIT_UNSUPPORTED; break;
+        }
+    } else {
+        X87Reg t0 = x87_get(s, 0), ti = x87_get(s, reg);
+        switch (op) {
+        case 0xD8:                                                       // ST0 = ST0 op ST(i)
+            if (d->regf == X87_COM || d->regf == X87_COMP) { x87_compare(s, t0, ti, false); if (d->regf == X87_COMP) x87_pop(s); }
+            else x87_put(s, 0, f80_arith(d->regf, t0, ti));
+            break;
+        case 0xDC: case 0xDE:                                            // ST(i) = ST(i) op ST0 (SUB/SUBR and DIV/DIVR swap)
+            if (op == 0xDE && d->regf == 3 && reg != 1) { result = X64_EXIT_ILLEGAL; break; }
+            if (d->regf == X87_COM || d->regf == X87_COMP) {
+                x87_compare(s, t0, ti, false);
+                if (d->regf == X87_COMP || op == 0xDE) x87_pop(s);
+                if (op == 0xDE && d->regf == 3) x87_pop(s);              // FCOMPP
+                break;
+            }
+            x87_put(s, reg, f80_arith(d->regf >= 4 ? d->regf ^ 1 : d->regf, ti, t0));
+            if (op == 0xDE) x87_pop(s);
+            break;
+        case 0xD9:
+            switch (d->regf) {
+            case 0: x87_push(s, ti); break;                              // FLD ST(i)
+            case 1: x87_put(s, 0, ti); x87_put(s, reg, t0); break;       // FXCH
+            case 2: if (reg) result = X64_EXIT_ILLEGAL; break;           // FNOP
+            case 3: x87_put(s, reg, t0); x87_pop(s); break;              // FSTP1
+            default: result = x87_misc(s, (uint8_t)(0xC0 | d->regf << 3 | reg)); break;
+            }
+            break;
+        case 0xDA: case 0xDB:
+            if (d->regf < 4) {                                           // FCMOVcc
+                static const uint64_t flag[4] = { FL_CF, FL_ZF, FL_CF | FL_ZF, FL_PF };
+                bool c = (s->rflags & flag[d->regf]) != 0;
+                if (op == 0xDB) c = !c;
+                if (!x87_valid(s, 0) || !x87_valid(s, reg)) x87_put(s, 0, F80_INDEFINITE);
+                else if (c) x87_put(s, 0, ti);
+            } else if (op == 0xDA && d->regf == 5 && reg == 1) {         // FUCOMPP
+                x87_compare(s, t0, ti, false); x87_pop(s); x87_pop(s);
+            } else if (op == 0xDB && d->regf == 4) {
+                if (reg == 2) s->fsw &= 0x7f00;                          // FNCLEX
+                else if (reg == 3) x87_init(s);                          // FNINIT
+                else if (reg > 4) result = X64_EXIT_ILLEGAL;             // FENI, FDISI, FSETPM: no-ops
+            } else if (op == 0xDB && (d->regf == 5 || d->regf == 6)) {   // FUCOMI FCOMI
+                x87_compare(s, t0, ti, true);
+            } else result = X64_EXIT_ILLEGAL;
+            break;
+        case 0xDD:
+            switch (d->regf) {
+            case 0: s->ftw &= (uint8_t)~(1 << ((x87_top(s) + reg) & 7)); break;   // FFREE
+            case 1: x87_put(s, 0, ti); x87_put(s, reg, t0); break;       // FXCH4
+            case 2: case 3: x87_put(s, reg, t0); if (d->regf == 3) x87_pop(s); break;   // FST(P) ST(i)
+            case 4: case 5: x87_compare(s, t0, ti, false); if (d->regf == 5) x87_pop(s); break;   // FUCOM(P)
+            default: result = X64_EXIT_ILLEGAL; break;
+            }
+            break;
+        default: // 0xDF
+            switch (d->regf) {
+            case 0: s->ftw &= (uint8_t)~(1 << ((x87_top(s) + reg) & 7)); x87_pop(s); break;   // FFREEP
+            case 1: x87_put(s, 0, ti); x87_put(s, reg, t0); break;       // FXCH7
+            case 2: case 3: x87_put(s, reg, t0); x87_pop(s); break;      // FSTP8/9
+            case 4: if (reg) result = X64_EXIT_ILLEGAL;                   // FNSTSW AX
+                    else s->gpr[X64_RAX] = (s->gpr[X64_RAX] & ~0xffffull) | s->fsw;
+                    break;
+            case 5: case 6: x87_compare(s, t0, ti, true); x87_pop(s); break;   // FUCOMIP FCOMIP
+            default: result = X64_EXIT_ILLEGAL; break;
+            }
+            break;
+        }
+    }
+    if (rc != sse_rc) fesetround(host_rounding(s->mxcsr));
+    return result;
+}
+
+// The 0F 60-7F and D0-FF rows without a prefix: MMX.
+static int mmx(X64State *s, Dec *d, uint8_t op)
+{
+    if (op == 0x77) { FIN(); s->ftw = 0; s->fsw &= (uint16_t)~0x3800; return CONT; }   // EMMS: all empty, TOP 0
+    modrm(d);
+    uint8_t imm = 0;
+    if (op == 0x70 || (op >= 0x71 && op <= 0x73) || op == 0xC4 || op == 0xC5) imm = fetch8(d);
+    FIN();
+    int r = d->regf;
+    switch (op) {
+    case 0x6C: case 0x6D: case 0xD0: case 0xD6: case 0xE6: case 0xF0: case 0xFF:
+        return X64_EXIT_ILLEGAL;
+    case 0x71: case 0x72: case 0x73: case 0xC5: case 0xD7: case 0xF7:
+        if (d->mem) return X64_EXIT_ILLEGAL;
+        break;
+    case 0xE7:
+        if (!d->mem) return X64_EXIT_ILLEGAL;
+        break;
+    }
+    uint64_t src = d->mem ? 0 : mm_get(s, d->rmf);
+    bool src_mm = op != 0x6E && op != 0x7E && op != 0x7F && op != 0xC4 && op != 0xE7;
+    if (d->mem && src_mm) src = mem_read(d->ea, op >= 0x60 && op <= 0x62 ? 4 : 8);   // low unpacks read 32 bits
+    mmx_enter(s);
+    X64Vec a = {{0}}, b = {{0}};
+    int i;
+    switch (op) {
+    case 0x6E: mm_set(s, r, get_rm(s, d, (d->rex & 8) ? 8 : 4)); return CONT;   // MOVD/MOVQ mm, r/m
+    case 0x6F: mm_set(s, r, src); return CONT;                                   // MOVQ mm, mm/m64
+    case 0x7E: set_rm(s, d, (d->rex & 8) ? 8 : 4, mm_get(s, r)); return CONT;   // MOVD/MOVQ r/m, mm
+    case 0x7F: case 0xE7:                                                        // MOVQ mm/m64, mm; MOVNTQ
+        if (d->mem) mem_write(d->ea, 8, mm_get(s, r));
+        else mm_set(s, d->rmf, mm_get(s, r));
+        return CONT;
+    case 0x70:                                                                   // PSHUFW
+        b.q[0] = src;
+        for (i = 0; i < 4; i++) a.w[i] = b.w[(imm >> (2 * i)) & 3];
+        mm_set(s, r, a.q[0]);
+        return CONT;
+    case 0x71: case 0x72: case 0x73: {
+        uint8_t equivalent = 0;
+        switch ((op << 4) | d->regf) {
+        case 0x712: equivalent = 0xD1; break;
+        case 0x714: equivalent = 0xE1; break;
+        case 0x716: equivalent = 0xF1; break;
+        case 0x722: equivalent = 0xD2; break;
+        case 0x724: equivalent = 0xE2; break;
+        case 0x726: equivalent = 0xF2; break;
+        case 0x732: equivalent = 0xD3; break;
+        case 0x736: equivalent = 0xF3; break;
+        default: return X64_EXIT_ILLEGAL;
+        }
+        a.q[0] = mm_get(s, d->rmf);
+        b.q[0] = imm;
+        pint(equivalent, &a, &b);
+        mm_set(s, d->rmf, a.q[0]);
+        return CONT;
+    }
+    case 0xC4: a.q[0] = mm_get(s, r); a.w[imm & 3] = (uint16_t)get_rm(s, d, 2); mm_set(s, r, a.q[0]); return CONT;   // PINSRW
+    case 0xC5:                                                                   // PEXTRW
+        b.q[0] = mm_get(s, d->rmf);
+        set_reg(s, d, d->reg, 4, b.w[imm & 3]);
+        return CONT;
+    case 0xD7:                                                                   // PMOVMSKB
+        b.q[0] = mm_get(s, d->rmf);
+        {
+            uint64_t m = 0;
+            for (i = 0; i < 8; i++) m |= (uint64_t)(b.b[i] >> 7) << i;
+            set_reg(s, d, d->reg, 4, m);
+        }
+        return CONT;
+    case 0xF7: {                                                                 // MASKMOVQ
+        if (d->m32 && d->addrsize) return X64_EXIT_UNSUPPORTED;   // DI
+        a.q[0] = mm_get(s, r);
+        b.q[0] = mm_get(s, d->rmf);
+        uint64_t di = (d->addrsize || d->m32 ? s->gpr[X64_RDI] & 0xffffffffull : s->gpr[X64_RDI]) + seg_base(s, d);
+        for (i = 0; i < 8; i++)
+            if (b.b[i] & 0x80) mem_write(ha(s, di + (uint64_t)i), 1, a.b[i]);
+        return CONT;
+    }
+    }
+    a.q[0] = mm_get(s, r);
+    b.q[0] = src;
+    uint8_t e = op;
+    if (op == 0x68 || op == 0x69 || op == 0x6A) { a.q[0] >>= 32; b.q[0] >>= 32; e = (uint8_t)(op - 8); }   // high unpacks
+    else if (op == 0x63 || op == 0x67 || op == 0x6B) a.q[1] = b.q[0];                                      // packs
+    if (!pint(e, &a, &b)) return X64_EXIT_UNSUPPORTED;
+    mm_set(s, r, a.q[0]);
+    return CONT;
+}
+
+// One-byte opcodes only 32-bit mode has.
+static int legacy32(X64State *s, Dec *d, uint8_t op)
+{
+    uint64_t v, al, ah, cf, af;
+    int size;
+    switch (op) {
+    case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47:
+    case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F:  // INC, DEC
+        FIN();
+        size = osz(d);
+        cf = s->rflags & FL_CF;
+        v = op < 0x48 ? op_add(s, get_reg(s, d, op & 7, size), 1, 0, size) : op_sub(s, get_reg(s, d, op & 7, size), 1, 0, size);
+        set_flags(s, FL_CF, cf);
+        set_reg(s, d, op & 7, size, v);
+        return CONT;
+    case 0x06: case 0x0E: case 0x16: case 0x1E: {   // PUSH ES CS SS DS: a 16-bit store, as Intel's CPUs do
+        FIN();
+        size = stack_size(s, d);
+        uint16_t sel = op == 0x06 ? s->seg_es : op == 0x0E ? s->seg_cs : op == 0x16 ? s->seg_ss : s->seg_ds;
+        uint64_t sp = ipm(s, s->gpr[X64_RSP] - (uint64_t)size);
+        mem_write(ha(s, sp), 2, sel);
+        s->gpr[X64_RSP] = sp;
+        return CONT;
+    }
+    case 0x07: case 0x17: case 0x1F:                // POP ES SS DS
+        FIN();
+        v = pop(s, stack_size(s, d));
+        if (op == 0x07) s->seg_es = (uint16_t)v; else if (op == 0x17) s->seg_ss = (uint16_t)v; else s->seg_ds = (uint16_t)v;
+        return CONT;
+    case 0x27: case 0x2F: {                         // DAA, DAS
+        FIN();
+        uint64_t old_al = s->gpr[X64_RAX] & 0xff, old_cf = s->rflags & FL_CF;
+        al = old_al;
+        cf = 0;
+        af = 0;
+        if ((al & 15) > 9 || (s->rflags & FL_AF)) {
+            cf = old_cf || (op == 0x27 ? al + 6 > 0xff : al < 6);
+            al = (op == 0x27 ? al + 6 : al - 6) & 0xff;
+            af = 1;
+        }
+        if (old_al > 0x99 || old_cf) { al = (op == 0x27 ? al + 0x60 : al - 0x60) & 0xff; cf = 1; }
+        else if (op == 0x27) cf = 0;
+        s->gpr[X64_RAX] = (s->gpr[X64_RAX] & ~0xffull) | al;
+        set_flags(s, FL_ARITH, (cf ? FL_CF : 0) | (af ? FL_AF : 0) | szp(al, 1));
+        return CONT;
+    }
+    case 0x37: case 0x3F: {                         // AAA, AAS
+        FIN();
+        uint64_t ax = s->gpr[X64_RAX] & 0xffff;
+        bool adjust = (ax & 15) > 9 || (s->rflags & FL_AF);
+        if (adjust) {
+            ax = op == 0x37 ? ax + 0x106 : (ax - 6) & 0xffff;   // AAS: AX - 6, then AH - 1
+            if (op == 0x3F) ax = (ax & 0xff) | ((((ax >> 8) - 1) & 0xff) << 8);
+        }
+        ax &= 0xff0f;
+        s->gpr[X64_RAX] = (s->gpr[X64_RAX] & ~0xffffull) | (ax & 0xffff);
+        set_flags(s, FL_CF | FL_AF, adjust ? FL_CF | FL_AF : 0);
+        return CONT;
+    }
+    case 0x60: {                                    // PUSHA
+        FIN();
+        size = d->opsize ? 2 : 4;
+        uint64_t sp = s->gpr[X64_RSP];
+        for (int i = 0; i < 8; i++) push(s, i == X64_RSP ? sp : s->gpr[i], size);
+        return CONT;
+    }
+    case 0x61:                                      // POPA
+        FIN();
+        size = d->opsize ? 2 : 4;
+        for (int i = 7; i >= 0; i--) {
+            v = pop(s, size);
+            if (i != X64_RSP) set_reg(s, d, i, size, v);
+        }
+        return CONT;
+    case 0xCE:                                      // INTO
+        FIN();
+        if (!(s->rflags & FL_OF)) return CONT;
+        d->disp = 4;
+        return X64_EXIT_INTERRUPT;
+    case 0xD4: case 0xD5: {                         // AAM, AAD
+        uint8_t imm = fetch8(d);
+        FIN();
+        al = s->gpr[X64_RAX] & 0xff;
+        ah = (s->gpr[X64_RAX] >> 8) & 0xff;
+        if (op == 0xD4) {
+            if (!imm) return X64_EXIT_DIVIDE_ERROR;
+            ah = al / imm;
+            al %= imm;
+        } else {
+            al = (al + ah * imm) & 0xff;
+            ah = 0;
+        }
+        s->gpr[X64_RAX] = (s->gpr[X64_RAX] & ~0xffffull) | (ah << 8) | al;
+        set_flags(s, FL_ARITH, szp(al, 1));
+        return CONT;
+    }
+    case 0xD6:                                      // SALC
+        FIN();
+        s->gpr[X64_RAX] = (s->gpr[X64_RAX] & ~0xffull) | ((s->rflags & FL_CF) ? 0xff : 0);
+        return CONT;
+    }
+    return X64_EXIT_ILLEGAL;
+}
 
 static int step(X64State *s, const X64Env *env, Dec *d)
 {
@@ -1256,13 +2124,16 @@ static int step(X64State *s, const X64Env *env, Dec *d)
     uint64_t v = 0, t;
 
     d->start = s->rip;
-    d->begin = d->p = (const uint8_t *)(uintptr_t)s->rip;
-    d->rex = 0; d->rep = 0; d->opsize = d->addrsize = d->lock = false; d->seg = -1; d->mem = false;
+    s->insn_start = s->rip;
+    d->m32 = s->mode32;
+    d->gbase = s->guest_base;
+    d->begin = d->p = (const uint8_t *)(uintptr_t)ha(s, s->rip);
+    d->rex = 0; d->rep = 0; d->opsize = d->addrsize = d->lock = false; d->seg = -1; d->mem = false; d->addr16 = false;
 
     for (;;) {
         if (d->p - d->begin >= 15) return X64_EXIT_ILLEGAL;
         op = *d->p;
-        if ((op & 0xF0) == 0x40) { d->rex = op; d->p++; continue; }
+        if ((op & 0xF0) == 0x40 && !d->m32) { d->rex = op; d->p++; continue; }   // INC/DEC in 32-bit mode
         switch (op) {
         case 0x66: d->opsize = true; break;
         case 0x67: d->addrsize = true; break;
@@ -1278,6 +2149,12 @@ static int step(X64State *s, const X64Env *env, Dec *d)
     }
 opcode:
     d->p++;
+    // 16-bit addressing in 32-bit mode: memory operands (modrm), and the instructions
+    // that address through registers or an absolute offset. A 67 prefix on anything
+    // else (a linker's "addr32 call") changes nothing.
+    if (d->m32 && d->addrsize && ((op >= 0xA0 && op <= 0xAF && op != 0xA8 && op != 0xA9) || op == 0xD7 ||
+                                  (op >= 0xE0 && op <= 0xE3)))
+        return X64_EXIT_UNSUPPORTED;
     if (op == 0x0F) {
         op = fetch8(d);
         map = 1;
@@ -1317,16 +2194,17 @@ opcode:
     }
     case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57:
         FIN();
-        size = d->opsize ? 2 : 8;
+        size = stack_size(s, d);
         push(s, s->gpr[(op & 7) | ((d->rex & 1) << 3)] & mask_of(size), size);
         return CONT;
     case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
         FIN();
-        size = d->opsize ? 2 : 8;
+        size = stack_size(s, d);
         v = pop(s, size);
         set_reg(s, d, (op & 7) | ((d->rex & 1) << 3), size, v);
         return CONT;
-    case 0x63: // MOVSXD
+    case 0x63: // MOVSXD (ARPL in 32-bit mode)
+        if (d->m32) return X64_EXIT_UNSUPPORTED;
         size = osz(d);
         modrm(d);
         FIN();
@@ -1334,7 +2212,7 @@ opcode:
         else set_reg(s, d, d->reg, size, get_rm(s, d, size));
         return CONT;
     case 0x68: case 0x6A: // PUSH imm
-        size = d->opsize ? 2 : 8;
+        size = stack_size(s, d);
         v = op == 0x6A ? (uint64_t)(int64_t)(int8_t)fetch8(d)
           : size == 2 ? fetch16(d) : (uint64_t)(int64_t)(int32_t)fetch32(d);
         FIN();
@@ -1357,10 +2235,13 @@ opcode:
     case 0x78: case 0x79: case 0x7A: case 0x7B: case 0x7C: case 0x7D: case 0x7E: case 0x7F:
         t = (uint64_t)(int64_t)(int8_t)fetch8(d);
         FIN();
-        if (cond(s, op & 15)) s->rip = d->next + t;
+        if (cond(s, op & 15)) s->rip = ipm(s, d->next + t);
         return CONT;
+    case 0x82: // 0x80 in 32-bit mode
+        if (!d->m32) return X64_EXIT_ILLEGAL;
+        /* fall through */
     case 0x80: case 0x81: case 0x83: {
-        size = op == 0x80 ? 1 : osz(d);
+        size = op == 0x80 || op == 0x82 ? 1 : osz(d);
         modrm(d);
         v = (op == 0x81 && size != 2) ? (uint64_t)(int64_t)(int32_t)fetch32(d)
           : (op == 0x81) ? fetch16(d) : (uint64_t)(int64_t)(int8_t)fetch8(d);
@@ -1423,7 +2304,7 @@ opcode:
         modrm(d);
         if (d->regf != 0) return X64_EXIT_UNSUPPORTED;
         FIN();
-        size = d->opsize ? 2 : 8;
+        size = stack_size(s, d);
         v = pop(s, size);
         if (d->mem && d->base == X64_RSP) d->ea += (uint64_t)size;   // the address uses the new RSP
         set_rm(s, d, size, v);
@@ -1458,12 +2339,12 @@ opcode:
         return CONT;
     case 0x9C: // PUSHF
         FIN();
-        size = d->opsize ? 2 : 8;
+        size = stack_size(s, d);
         push(s, (s->rflags | 2) & mask_of(size) & ~0x30000ull, size);
         return CONT;
     case 0x9D: // POPF
         FIN();
-        size = d->opsize ? 2 : 8;
+        size = stack_size(s, d);
         v = pop(s, size);
         set_flags(s, FL_POPF & mask_of(size), v);
         s->rflags |= 2 | FL_IF;
@@ -1479,9 +2360,9 @@ opcode:
         return CONT;
     case 0xA0: case 0xA1: case 0xA2: case 0xA3: { // MOV with a 64-bit absolute address
         size = (op & 1) ? osz(d) : 1;
-        uint64_t addr = d->addrsize ? fetch32(d) : fetch64(d);
+        uint64_t addr = d->addrsize || d->m32 ? fetch32(d) : fetch64(d);
         FIN();
-        addr += seg_base(s, d);
+        addr = ha(s, addr + seg_base(s, d));
         if (op < 0xA2) set_reg(s, d, X64_RAX, size, mem_read(addr, size));
         else mem_write(addr, size, s->gpr[X64_RAX]);
         return CONT;
@@ -1520,8 +2401,8 @@ opcode:
     case 0xC2: case 0xC3: { // RET
         uint16_t release = op == 0xC2 ? fetch16(d) : 0;
         FIN();
-        s->rip = pop(s, 8);
-        s->gpr[X64_RSP] += release;
+        s->rip = pop(s, s->mode32 ? 4 : 8);
+        s->gpr[X64_RSP] = ipm(s, s->gpr[X64_RSP] + release);
         return CONT;
     }
     case 0xC4: case 0xC5: case 0x62: // VEX, EVEX
@@ -1539,16 +2420,20 @@ opcode:
         uint8_t level = fetch8(d);
         FIN();
         if (level & 31) return X64_EXIT_UNSUPPORTED;
-        push(s, s->gpr[X64_RBP], 8);
-        s->gpr[X64_RBP] = s->gpr[X64_RSP];
-        s->gpr[X64_RSP] -= frame;
+        size = stack_size(s, d);
+        push(s, s->gpr[X64_RBP], size);
+        set_reg(s, d, X64_RBP, size, s->gpr[X64_RSP]);
+        s->gpr[X64_RSP] = ipm(s, s->gpr[X64_RSP] - frame);
         return CONT;
     }
-    case 0xC9: // LEAVE
+    case 0xC9: { // LEAVE (the read first, so a fault changes nothing)
         FIN();
-        s->gpr[X64_RSP] = s->gpr[X64_RBP];
-        s->gpr[X64_RBP] = pop(s, 8);
+        size = stack_size(s, d);
+        v = mem_read(ha(s, s->gpr[X64_RBP]), size);
+        s->gpr[X64_RSP] = ipm(s, s->gpr[X64_RBP] + (uint64_t)size);
+        set_reg(s, d, X64_RBP, size, v);
         return CONT;
+    }
     case 0xCC: // INT3
         FIN();
         return X64_EXIT_BREAKPOINT;
@@ -1561,25 +2446,15 @@ opcode:
         return X64_EXIT_BREAKPOINT;
     case 0xD7: // XLAT
         FIN();
-        v = (d->addrsize ? s->gpr[X64_RBX] & 0xffffffffull : s->gpr[X64_RBX]) + (s->gpr[X64_RAX] & 0xff);
-        set_reg(s, d, X64_RAX, 1, mem_read(v + seg_base(s, d), 1));
+        v = (d->addrsize || d->m32 ? s->gpr[X64_RBX] & 0xffffffffull : s->gpr[X64_RBX]) + (s->gpr[X64_RAX] & 0xff);
+        set_reg(s, d, X64_RAX, 1, mem_read(ha(s, v + seg_base(s, d)), 1));
         return CONT;
-    case 0xD9: case 0xDB: case 0xDD: case 0xDF: case 0xD8: case 0xDA: case 0xDC: case 0xDE: {
-        // x87: only the control and status word instructions C runtimes use.
-        modrm(d);
-        FIN();
-        if (op == 0xD9 && d->mem && d->regf == 5) { s->fcw = (uint16_t)mem_read(d->ea, 2); return CONT; }   // FLDCW
-        if (op == 0xD9 && d->mem && d->regf == 7) { mem_write(d->ea, 2, s->fcw); return CONT; }              // FNSTCW
-        if (op == 0xDD && d->mem && d->regf == 7) { mem_write(d->ea, 2, s->fsw); return CONT; }              // FNSTSW m16
-        if (op == 0xDF && !d->mem && d->regf == 4 && d->rmf == 0) { set_reg(s, d, X64_RAX, 2, s->fsw); return CONT; } // FNSTSW AX
-        if (op == 0xDB && !d->mem && d->regf == 4 && d->rmf == 3) { s->fcw = 0x37f; s->fsw = 0; return CONT; }        // FNINIT
-        if (op == 0xDB && !d->mem && d->regf == 4 && d->rmf == 2) { s->fsw &= 0x7f00; return CONT; }                  // FNCLEX
-        return X64_EXIT_UNSUPPORTED;
-    }
+    case 0xD8: case 0xD9: case 0xDA: case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+        return x87(s, d, op);
     case 0xE0: case 0xE1: case 0xE2: case 0xE3: { // LOOPNE LOOPE LOOP JRCXZ
         t = (uint64_t)(int64_t)(int8_t)fetch8(d);
         FIN();
-        int asize = d->addrsize ? 4 : 8;
+        int asize = d->addrsize || d->m32 ? 4 : 8;
         uint64_t count = s->gpr[X64_RCX] & mask_of(asize);
         bool take;
         if (op == 0xE3) take = count == 0;
@@ -1590,7 +2465,7 @@ opcode:
             if (op == 0xE0) take = take && !(s->rflags & FL_ZF);
             if (op == 0xE1) take = take && (s->rflags & FL_ZF);
         }
-        if (take) s->rip = d->next + t;
+        if (take) s->rip = ipm(s, d->next + t);
         return CONT;
     }
     case 0xE8: // CALL rel32
@@ -1686,17 +2561,33 @@ opcode:
         }
         if (op == 0xFE) return X64_EXIT_ILLEGAL;
         switch (d->regf) {
-        case 2: return call(s, env, get_rm(s, d, 8), d->next);
-        case 4: return jump(s, env, get_rm(s, d, 8));
+        case 2: return call(s, env, get_rm(s, d, d->m32 ? 4 : 8), d->next);
+        case 4: return jump(s, env, get_rm(s, d, d->m32 ? 4 : 8));
         case 6:
-            size = d->opsize ? 2 : 8;
+            size = stack_size(s, d);
             push(s, get_rm(s, d, size), size);
             return CONT;
         default: return X64_EXIT_UNSUPPORTED;   // far CALL and JMP
         }
     }
+    case 0x8E: { // MOV Sreg, r/m16
+        modrm(d);
+        FIN();
+        uint16_t sel = (uint16_t)get_rm(s, d, 2);
+        switch (d->regf) {
+        case 0: s->seg_es = sel; return CONT;
+        case 2: s->seg_ss = sel; return CONT;
+        case 3: s->seg_ds = sel; return CONT;
+        case 4: s->seg_fs = sel; return CONT;   // the base (the TEB) stays
+        case 5: s->seg_gs = sel; return CONT;
+        default: return X64_EXIT_ILLEGAL;
+        }
+    }
+    case 0x9A: case 0xEA: case 0xCA: case 0xCB: case 0xCF: // far CALL, JMP, RET; IRET
+        return d->m32 || op >= 0xCA ? X64_EXIT_UNSUPPORTED : X64_EXIT_ILLEGAL;
     default:
-        return X64_EXIT_ILLEGAL;   // the opcodes 64-bit mode removed (06, 07, 27, 60, 9A, D4...)
+        if (d->m32) return legacy32(s, d, op);
+        return X64_EXIT_ILLEGAL;   // the opcodes 64-bit mode removed (06, 07, 27, 60, D4...)
     }
 
     if (map != 1) return sse(s, d, map, op);
@@ -1726,13 +2617,26 @@ opcode:
     case 0x88: case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8E: case 0x8F: // Jcc rel32
         t = (uint64_t)(int64_t)(int32_t)fetch32(d);
         FIN();
-        if (cond(s, op & 15)) s->rip = d->next + t;
+        if (cond(s, op & 15)) s->rip = ipm(s, d->next + t);
         return CONT;
     case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:
     case 0x98: case 0x99: case 0x9A: case 0x9B: case 0x9C: case 0x9D: case 0x9E: case 0x9F: // SETcc
         modrm(d);
         FIN();
         set_rm(s, d, 1, cond(s, op & 15));
+        return CONT;
+    case 0xA0: case 0xA8: { // PUSH FS, PUSH GS: a 16-bit store, as Intel's CPUs do
+        FIN();
+        size = stack_size(s, d);
+        uint64_t sp = ipm(s, s->gpr[X64_RSP] - (uint64_t)size);
+        mem_write(ha(s, sp), 2, op == 0xA0 ? s->seg_fs : s->seg_gs);
+        s->gpr[X64_RSP] = sp;
+        return CONT;
+    }
+    case 0xA1: case 0xA9: // POP FS, POP GS (the bases stay)
+        FIN();
+        v = pop(s, stack_size(s, d));
+        if (op == 0xA1) s->seg_fs = (uint16_t)v; else s->seg_gs = (uint16_t)v;
         return CONT;
     case 0xA2: { // CPUID
         FIN();
@@ -1953,6 +2857,24 @@ void x64_state_init(X64State *s)
     s->seg_fs = 0x53;
 }
 
+void x64_state_init32(X64State *s, uint64_t guest_base)
+{
+    x64_state_init(s);
+    s->mode32 = true;
+    s->guest_base = guest_base;
+    s->seg_cs = 0x23;
+}
+
+void x64_fxsave(const X64State *s, void *area)
+{
+    fx_store(s, (uint8_t *)area);
+}
+
+void x64_fxrstor(X64State *s, const void *area)
+{
+    fx_load(s, (const uint8_t *)area);
+}
+
 X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *info)
 {
     int saved_rounding = fegetround();
@@ -1980,7 +2902,7 @@ X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *in
             memset(info, 0, sizeof *info);
             info->rip = start;
             info->length = (uint8_t)length;
-            memcpy(info->bytes, (const void *)(uintptr_t)start, length);
+            memcpy(info->bytes, (const void *)(uintptr_t)ha(s, start), length);
             if (r == X64_EXIT_INTERRUPT) info->vector = (uint8_t)d.disp;
         }
         break;
@@ -1991,8 +2913,14 @@ X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *in
 
 void x64_return_from_native(X64State *s, uint64_t rax)
 {
-    s->gpr[X64_RAX] = rax;
-    s->rip = pop(s, 8);
+    if (s->mode32) {
+        s->gpr[X64_RAX] = (uint32_t)rax;
+        s->gpr[X64_RDX] = rax >> 32;
+        s->rip = pop(s, 4);
+    } else {
+        s->gpr[X64_RAX] = rax;
+        s->rip = pop(s, 8);
+    }
 }
 
 void x64_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
@@ -2011,8 +2939,8 @@ void x64_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
         out[0] = 0x000006f0;                            // family 6
         out[1] = (1u << 16) | (8u << 8);                // one logical processor, 64-byte CLFLUSH line
         out[2] = (1u << 0) | (1u << 13) | (1u << 23);   // SSE3, CMPXCHG16B, POPCNT
-        out[3] = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 15) | (1u << 19)
-               | (1u << 24) | (1u << 25) | (1u << 26);  // FPU TSC CX8 CMOV CLFSH FXSR SSE SSE2
+        out[3] = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 15) | (1u << 19) | (1u << 23)
+               | (1u << 24) | (1u << 25) | (1u << 26);  // FPU TSC CX8 CMOV CLFSH MMX FXSR SSE SSE2
         break;
     case 0x80000000:
         out[0] = 0x80000004;
@@ -2066,9 +2994,9 @@ void x64_state_from_context(X64State *s, const void *context)
     memcpy(&s->seg_fs, c + CTX_SEGFS, 2);
     memcpy(&s->seg_gs, c + CTX_SEGGS, 2);
     memcpy(&s->seg_ss, c + CTX_SEGSS, 2);
-    memcpy(&s->fcw, c + CTX_FLTSAVE + 0, 2);
-    memcpy(&s->fsw, c + CTX_FLTSAVE + 2, 2);
-    memcpy(s->xmm, c + CTX_XMM0, sizeof s->xmm);
+    uint32_t mxcsr = s->mxcsr;
+    fx_load(s, c + CTX_FLTSAVE);
+    s->mxcsr = mxcsr;   // CONTEXT.MxCsr is the one that counts
 }
 
 void x64_state_to_context(const X64State *s, void *context)
@@ -2086,7 +3014,5 @@ void x64_state_to_context(const X64State *s, void *context)
     memcpy(c + CTX_SEGFS, &s->seg_fs, 2);
     memcpy(c + CTX_SEGGS, &s->seg_gs, 2);
     memcpy(c + CTX_SEGSS, &s->seg_ss, 2);
-    memcpy(c + CTX_FLTSAVE + 0, &s->fcw, 2);
-    memcpy(c + CTX_FLTSAVE + 2, &s->fsw, 2);
-    memcpy(c + CTX_XMM0, s->xmm, sizeof s->xmm);
+    fx_store(s, c + CTX_FLTSAVE);
 }

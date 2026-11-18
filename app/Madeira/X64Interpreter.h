@@ -37,6 +37,14 @@ typedef union X64Vec {
     uint64_t q[2];
 } X64Vec;
 
+/// An x87 register as x86 stores it: a 64-bit significand with its explicit
+/// integer bit, then sign and 15-bit exponent (the layout of an FXSAVE slot).
+typedef struct X87Reg {
+    uint64_t mantissa;
+    uint16_t exponent;      // sign in bit 15
+    uint16_t pad[3];
+} X87Reg;
+
 typedef struct X64State {
     uint64_t gpr[16];           // RAX RCX RDX RBX RSP RBP RSI RDI R8-R15
     uint64_t rip;
@@ -44,9 +52,20 @@ typedef struct X64State {
     uint64_t fs_base, gs_base;  // GS is the TEB on Windows
     X64Vec xmm[16];
     uint32_t mxcsr;
-    uint16_t fcw, fsw;          // x87 control and status words (no x87 arithmetic)
+    uint16_t fcw, fsw;          // x87 control and status words; TOP is fsw bits 11-13
     uint16_t seg_cs, seg_ds, seg_es, seg_fs, seg_gs, seg_ss;
     uint64_t instructions;      // instructions retired, for statistics
+    // x87 registers by physical number: ST(i) is st[(TOP + i) & 7]. The MMX
+    // registers are their significands. Arithmetic is done in double precision,
+    // which is what Windows' default control word (0x27F, 53-bit) asks for;
+    // loads, stores and moves keep all 80 bits.
+    X87Reg st[8];
+    uint8_t ftw;                // abridged tag word: bit i set while st[i] holds a value
+    // 32-bit (WoW64) code: 32-bit registers, addresses and stack. Guest address a
+    // is host address guest_base + a (Madeira's guest window; 0 elsewhere).
+    bool mode32;
+    uint64_t guest_base;
+    uint64_t insn_start;        // the instruction being executed, for fault reporting
 } X64State;
 
 typedef enum X64Exit {
@@ -80,8 +99,12 @@ typedef struct X64ExitInfo {
 } X64ExitInfo;
 
 /// Registers as a new Windows thread has them: flags 0x202, MXCSR 0x1F80,
-/// x87 control word 0x27F, user-mode selectors.
+/// x87 control word 0x27F, user-mode selectors. 64-bit mode.
 void x64_state_init(X64State *state);
+
+/// The same for a 32-bit (WoW64) thread whose guest address 0 is host address
+/// `guest_base`.
+void x64_state_init32(X64State *state, uint64_t guest_base);
 
 /// Runs guest code from state->rip until an exit. `budget` is the most
 /// instructions to run (UINT64_MAX: no limit); a REP string instruction counts
@@ -90,11 +113,18 @@ void x64_state_init(X64State *state);
 X64Exit x64_run(X64State *state, const X64Env *env, uint64_t budget, X64ExitInfo *info);
 
 /// Finishes a call that left with X64_EXIT_NATIVE: RAX takes the native
-/// function's result and the return address is popped into rip.
+/// function's result and the return address is popped into rip. In 32-bit mode
+/// EAX takes the low half and EDX the high half (a 64-bit cdecl result).
 void x64_return_from_native(X64State *state, uint64_t rax);
 
+/// The 512-byte FXSAVE image of the x87, MMX, SSE and MXCSR state, as Windows
+/// keeps it in CONTEXT.FltSave and I386_CONTEXT.ExtendedRegisters. Bytes 416-511
+/// are left as they are.
+void x64_fxsave(const X64State *state, void *area);
+void x64_fxrstor(X64State *state, const void *area);
+
 /// The CPUID answers the interpreter gives: a fixed profile of what it implements
-/// (SSE, SSE2, SSE3, CMPXCHG16B, POPCNT, LZCNT; no AVX, no x87 arithmetic).
+/// (x87, MMX, SSE, SSE2, SSE3, CMPXCHG16B, POPCNT, LZCNT; no AVX).
 void x64_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 
 const char *x64_exit_name(X64Exit exit);

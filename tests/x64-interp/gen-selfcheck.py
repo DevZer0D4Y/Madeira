@@ -24,58 +24,70 @@ if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'AMD64')
     raise SystemExit('gen-selfcheck.py runs the programs natively: it needs x86-64 Linux')
 
 # The CPU the interpreter reports (x64_cpuid): SSE3, POPCNT, LZCNT, CMPXCHG16B; nothing newer.
-CFLAGS = ['-O2', '-mabi=ms', '-march=x86-64', '-msse3', '-mpopcnt', '-mlzcnt', '-mcx16', '-fPIC',
-          '-fvisibility=hidden', '-ffreestanding', '-fno-builtin', '-fno-stack-protector', '-fcf-protection=none',
-          '-fno-asynchronous-unwind-tables', '-fno-unwind-tables', '-fno-tree-loop-distribute-patterns',
-          '-fno-math-errno', '-mno-red-zone', '-fno-plt']
+COMMON = ['-O2', '-mpopcnt', '-mlzcnt', '-fPIC', '-fvisibility=hidden', '-ffreestanding', '-fno-builtin',
+          '-fno-stack-protector', '-fcf-protection=none', '-fno-asynchronous-unwind-tables', '-fno-unwind-tables',
+          '-fno-tree-loop-distribute-patterns', '-fno-math-errno', '-fno-plt']
+FLAGS = {
+    64: ['-mabi=ms', '-march=x86-64', '-msse3', '-mcx16', '-mno-red-zone'] + COMMON,
+    # 32-bit as older games are built: x87 floating point, MMX; 64-bit division through libgcc.
+    32: ['-m32', '-march=i686', '-mmmx', '-msse', '-mfpmath=387'] + COMMON,
+}
 SEEDS = [0x1, 0x5eed1234cafef00d]
-LINKER_SCRIPT = '''
+LINKER_SCRIPT = """
 SECTIONS {
   . = 0;
   .text : { *(.text .text.*) }
   . = ALIGN(64);
-  .rodata : { *(.rodata .rodata.*) *(.data.rel.ro .data.rel.ro.*) }
+  .rodata : { *(.rodata .rodata.*) *(.data.rel.ro .data.rel.ro.*) *(.got .got.plt) }
   . = ALIGN(64);
   .data : { *(.data .data.*) *(.bss .bss.*) *(COMMON) }
   /DISCARD/ : { *(.comment) *(.note .note.*) *(.eh_frame*) }
 }
-'''
+"""
 
 
 def run(*args, **kwargs):
-    result = subprocess.run(args, capture_output=True, text=True, **kwargs)
+    result = subprocess.run([str(a) for a in args], capture_output=True, text=True, **kwargs)
     if result.returncode:
         raise SystemExit(f'{" ".join(map(str, args))}\n{result.stdout}{result.stderr}')
     return result.stdout
 
 
-with tempfile.TemporaryDirectory(prefix='nojit-selfcheck-') as folder:
-    folder = Path(folder)
-    obj, elf, blob = folder / 'workloads.o', folder / 'workloads.elf', folder / 'workloads.bin'
-    run('gcc', '-c', *CFLAGS, str(here / 'workloads.c'), '-o', str(obj))
-    # Only PC-relative references: the blob runs wherever it is copied.
-    relocations = run('readelf', '-rW', str(obj))
-    absolute = [line for line in relocations.splitlines() if re.search(r'R_X86_64_(64|32S?|GOT|RELATIVE)\b', line)]
+def build(bits, folder):
+    obj, elf, blob = folder / f'w{bits}.o', folder / f'w{bits}.elf', folder / f'w{bits}.bin'
+    run('gcc', '-c', *FLAGS[bits], here / 'workloads.c', '-o', obj)
+    # Only PC- and GOT-relative references: the blob runs wherever it is copied.
+    relocations = run('readelf', '-rW', obj)
+    absolute = [line for line in relocations.splitlines() if re.search(r'R_X86_64_(64|32S?|GOT|RELATIVE)\b|R_386_(32|RELATIVE)\b', line)]
     if absolute:
         raise SystemExit('workloads.c needs load-time relocation:\n' + '\n'.join(absolute))
     (folder / 'flat.ld').write_text(LINKER_SCRIPT)
-    run('gcc', '-nostdlib', '-static', '-no-pie', '-Wl,--build-id=none', '-Wl,-T,' + str(folder / 'flat.ld'),
-        str(obj), '-o', str(elf))
-    run('objcopy', '-O', 'binary', '--only-section=.text', '--only-section=.rodata', '--only-section=.data',
-        str(elf), str(blob))
+    extra = ['-m32'] if bits == 32 else []
+    libgcc = [run('gcc', '-m32', '-print-libgcc-file-name').strip()] if bits == 32 else []
+    run('gcc', *extra, '-nostdlib', '-static', '-no-pie', '-Wl,--build-id=none', '-Wl,-T,' + str(folder / 'flat.ld'),
+        obj, *libgcc, '-o', elf)
+    linked = run('readelf', '-rW', elf)
+    if 'R_386_32 ' in linked or 'R_X86_64_64 ' in linked:
+        raise SystemExit('the linked blob needs relocation')
+    run('objcopy', '-O', 'binary', '--only-section=.text', '--only-section=.rodata', '--only-section=.data', elf, blob)
     entries = {}
-    for line in run('nm', '--defined-only', str(elf)).splitlines():
+    for line in run('nm', '--defined-only', elf).splitlines():
         address, kind, name = line.split()
         if name.startswith('wl_') and kind in 'tT':
             entries[name[3:]] = int(address, 16)
     data = blob.read_bytes()
     if any(offset >= len(data) for offset in entries.values()):
         raise SystemExit('an entry lies outside the blob')
-
-    runner = folder / 'run-native'
-    run('gcc', '-O1', '-I', str(root / 'app/Madeira'), str(here / 'run-native.c'), '-o', str(runner))
+    runner = folder / f'run-native{bits}'
+    run('gcc', *extra, '-O1', '-I', root / 'app/Madeira', here / 'run-native.c', '-o', runner)
     cases = [f'{name}:{offset:x}:{seed:x}' for name, offset in sorted(entries.items(), key=lambda e: e[1]) for seed in SEEDS]
-    results = [line.split() for line in run(str(runner), str(blob), *cases).splitlines()]
+    results = [line.split() for line in run(runner, blob, *cases).splitlines()]
+    return data, entries, results
+
+
+with tempfile.TemporaryDirectory(prefix='nojit-selfcheck-') as folder:
+    folder = Path(folder)
+    built = {bits: build(bits, folder) for bits in (64, 32)}
     gcc = run('gcc', '--version').splitlines()[0]
 
 lines = [
@@ -84,29 +96,35 @@ lines = [
     '//',
     '// Generated by tests/x64-interp/gen-selfcheck.py from tests/x64-interp/workloads.c: do not edit.',
     f'// Compiler: {gcc}',
-    f'// Flags: {" ".join(CFLAGS)}',
-    '// Expected results come from running these bytes on an x86-64 CPU.',
+    f'// 64-bit flags: {" ".join(FLAGS[64])}',
+    f'// 32-bit flags: {" ".join(FLAGS[32])}',
+    '// The 32-bit blob also holds libgcc\'s 64-bit division helpers (GCC Runtime Library Exception).',
+    '// Expected results come from running these bytes on an x86-64 CPU (the 32-bit ones in a',
+    '// 32-bit process, with Windows\' x87 control word 0x27F).',
     '',
     '#ifndef NOJIT_SELF_CHECK_DATA_H',
     '#define NOJIT_SELF_CHECK_DATA_H',
     '',
     '#include <stdint.h>',
     '',
-    f'#define NOJIT_SELFCHECK_BLOB_SHA256 "{hashlib.sha256(data).hexdigest()}"',
-    '',
-    f'static const uint8_t nojit_selfcheck_blob[{len(data)}] __attribute__((aligned(64))) = {{',
 ]
-for i in range(0, len(data), 16):
-    lines.append('    ' + ' '.join(f'0x{b:02x},' for b in data[i:i + 16]))
+for bits in (64, 32):
+    data = built[bits][0]
+    lines += [f'#define NOJIT_SELFCHECK_BLOB{bits}_SHA256 "{hashlib.sha256(data).hexdigest()}"',
+              f'static const uint8_t nojit_selfcheck_blob{bits}[{len(data)}] __attribute__((aligned(64))) = {{']
+    for i in range(0, len(data), 16):
+        lines.append('    ' + ' '.join(f'0x{b:02x},' for b in data[i:i + 16]))
+    lines += ['};', '']
 lines += [
-    '};',
-    '',
-    'struct NoJITCase { const char *name; uint32_t entry; uint64_t seed; uint64_t expect; };',
+    'struct NoJITCase { const char *name; uint8_t bits; uint32_t entry; uint64_t seed; uint64_t expect; };',
     '',
     'static const struct NoJITCase nojit_selfcheck_cases[] = {',
 ]
-for name, seed, result in results:
-    lines.append(f'    {{ "{name}", 0x{entries[name]:x}, 0x{int(seed, 16):x}ull, 0x{int(result, 16):016x}ull }},')
+for bits in (64, 32):
+    data, entries, results = built[bits]
+    for name, seed, result in results:
+        lines.append(f'    {{ "{name}", {bits}, 0x{entries[name]:x}, 0x{int(seed, 16):x}ull, 0x{int(result, 16):016x}ull }},')
 lines += ['};', '', '#endif // NOJIT_SELF_CHECK_DATA_H', '']
 out.write_text('\n'.join(lines))
-print(f'{out.relative_to(root) if out.is_relative_to(root) else out}: {len(data)} bytes, {len(results)} programs')
+total = sum(len(built[b][2]) for b in built)
+print(f'{out.relative_to(root) if out.is_relative_to(root) else out}: {len(built[64][0])} + {len(built[32][0])} bytes, {total} programs')
