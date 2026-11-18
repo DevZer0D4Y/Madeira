@@ -38,6 +38,8 @@ enum {
     X87INT = 1 << 15,
     X87NEAR = 1 << 22,  // x87 values within 2^20 of 1 (FPREM reduces them in one step)
     X87UNIT = 1 << 23,  // x87 values within 0.25 of 0 (F2XM1 and FYL2XP1's domain)
+    X87FULL = 1 << 24,  // any 80-bit values (full significands, every exponent, denormals, NaNs,
+                        // unsupported encodings), and random precision and rounding control
 };
 
 // Every rnd() call is its own statement: the order C evaluates a function's
@@ -205,6 +207,39 @@ static void rnd_x87(uint8_t *slot, uint64_t flags)
     else put_f80(slot, 0, sign);
 }
 
+// Any 80-bit value, weighted towards the cases arithmetic treats differently.
+static void rnd_x87_full(uint8_t *slot)
+{
+    uint64_t m = rnd() | 0x8000000000000000ull;
+    uint64_t r = rnd();
+    uint16_t sign = (uint16_t)(r & 0x8000);
+    unsigned kind = (unsigned)((r >> 16) % 18);
+    unsigned e;
+    if (kind >= 16) m = kind == 16 ? ~0ull : 0x8000000000000000ull;   // all ones (carries; a square root just below a half), a power of two
+    switch (kind) {
+    case 0: put_f80(slot, 0, sign); return;                                             // zero
+    case 1: put_f80(slot, 0x8000000000000000ull, sign | 0x7fff); return;                 // infinity
+    case 2: put_f80(slot, m | ((r >> 24) & 1 ? 0x4000000000000000ull : 0), sign | 0x7fff); return;   // a NaN
+    case 3: put_f80(slot, (m & 0x7fffffffffffffffull) >> ((r >> 24) % 64), sign); return;          // denormal
+    case 4: e = 1 + (unsigned)((r >> 24) % 70); break;                                    // near the bottom
+    case 5: e = 0x7ffe - (unsigned)((r >> 24) % 70); break;                               // near the top
+    case 6: e = 1 + (unsigned)((r >> 24) % 0x7ffe); break;                                // anywhere
+    case 7: put_f80(slot, m & 0xffffffffff000000ull, (uint16_t)(sign | (16383 - 30 + (r >> 24) % 61))); return;  // a float
+    case 8: put_f80(slot, m & 0xfffffffffffff800ull, (uint16_t)(sign | (16383 - 30 + (r >> 24) % 61))); return;  // a double
+    case 9: put_f80(slot, m & 0xfffffffffffff800ull, (uint16_t)(sign | (16383 - 1022 + (r >> 24) % 2046))); return;  // any double
+    case 10: {                                                                             // rarely, unsupported
+        unsigned which = (unsigned)((r >> 24) % 8);
+        if (which == 0) put_f80(slot, m & 0x7fffffffffffffffull, (uint16_t)(sign | (1 + (r >> 32) % 0x7ffe)));   // unnormal
+        else if (which == 1) put_f80(slot, m & 0x7fffffffffffffffull, sign | 0x7fff);   // pseudo-NaN or pseudo-infinity
+        else if (which == 2) put_f80(slot, m, sign);                                      // pseudo-denormal
+        else put_f80(slot, m, (uint16_t)(sign | (16383 - 30 + (r >> 32) % 61)));
+        return;
+    }
+    default: e = 16383 - 30 + (unsigned)((r >> 24) % 61); break;                          // near 1
+    }
+    put_f80(slot, m, (uint16_t)(sign | e));
+}
+
 static void setup_input32(uint64_t flags)
 {
     struct NState32 *in = IN32;
@@ -223,6 +258,12 @@ static void setup_input32(uint64_t flags)
     memset(fx, 0, 512);
     uint16_t fcw = 0x027f, fsw;
     if (flags & X87RC) fcw = (uint16_t)(fcw | ((rnd() % 4) << 10));
+    if (flags & X87FULL) {
+        static const uint16_t precision[] = { 0x000, 0x200, 0x300 };   // 24, 53, 64 bits
+        uint16_t pc = precision[rnd() % 3];
+        uint16_t rc = (uint16_t)((rnd() % 4) << 10);
+        fcw = (uint16_t)(0x007f | pc | rc);
+    }
     int top = (int)(rnd() % 8);
     int used = (flags & MMX) ? 8 : 2 + (int)(rnd() % 4);
     fsw = (uint16_t)((top << 11) | (rnd() & 0x4700));
@@ -236,6 +277,8 @@ static void setup_input32(uint64_t flags)
             uint64_t mantissa = rnd();
             uint16_t exponent = (uint16_t)rnd();
             put_f80(fx + 32 + 16 * i, mantissa, exponent);
+        } else if (flags & X87FULL) {
+            rnd_x87_full(fx + 32 + 16 * i);
         } else {
             rnd_x87(fx + 32 + 16 * i, flags);
         }

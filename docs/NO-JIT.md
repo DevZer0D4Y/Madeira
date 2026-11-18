@@ -41,17 +41,19 @@ D3D9 front end runs there too, so only the game's own code is interpreted.
 
 Steps, in order:
 
-1. **The CPU module** (done, not yet run in Wine): `build/wow64-interp`, below.
-2. **Run it in Wine on a PC.** Build Wine for x86-64 Linux with its new WoW64
-   (`--enable-archs=i386,x86_64`) and point
-   `HKLM\Software\Microsoft\Wow64\x86` at `wow64interp.dll` (wow64.dll reads
-   the module's name there; the default is `wow64cpu.dll`). 32-bit programs
-   then run interpreted, which tests the module against real Wine.
-3. **Run it in Madeira with JIT on**, in place of `xtajit.dll`, the same way.
-   The ARM64 build reads the TEB through x18 like Madeira's other ARM64 modules
-   and needs the same handling. Check what Madeira's `wow64.dll` expects when
-   the guest window base B is not 0: the module passes host addresses (B + a)
-   for a unix call's arguments and a fault's exception address.
+1. **The CPU module** (done): `build/wow64-interp`, below.
+2. **Run it in Wine on a PC** (done): in Wine 11.4 built for x86-64 Linux,
+   32-bit programs run through it and print what they print on the processor
+   (Testing, below). Madeira's own Wine does not build for Linux (its ntdll
+   uses Apple's APIs), so this was upstream Wine 11.4, the release Madeira's
+   is based on.
+3. **Run it in Madeira with JIT on**, in place of `xtajit.dll`: set
+   `HKLM\Software\Microsoft\Wow64\x86` to `wow64interp.dll` (wow64.dll reads
+   the module's name there). The ARM64 build reads the TEB through x18 like
+   Madeira's other ARM64 modules and needs the same handling. The module
+   follows the rules of Madeira's guest window as FEX's module does (guest
+   addresses for what 32-bit code sees, host addresses for what the 64-bit side
+   dereferences); that part could not run on Linux, where B is 0.
 4. **The four native modules as signed code**: convert them to Mach-O when
    Madeira is built, so the sideloader signs them with the app and iOS loads
    them like any other library. The open upstream pull request #497 does this
@@ -108,12 +110,21 @@ Implemented:
   as real host atomics, and `XCHG` with memory always atomic;
 - string instructions with `REP`, `REPE` and `REPNE`, in both directions;
 - **x87**, the whole instruction set: registers keep all 80 bits through loads,
-  stores, moves, integer and BCD conversions and comparisons, and arithmetic is
-  done in double, which is what Windows' default control word (0x27F, 53-bit
-  precision) asks for. Rounding follows the control word, and empty and full
-  registers behave as x87's masked stack faults do. Transcendental results
-  (`FSIN`, `FPTAN`, `FYL2X`...) are double's. A result outside double's
-  exponent range, which x87 can hold, becomes infinity or zero;
+  stores, moves, integer and BCD conversions and comparisons. `FADD`, `FSUB`,
+  `FMUL`, `FDIV` and `FSQRT` give the x87's results bit for bit at each
+  precision the control word can ask for: 53 bits (Windows' default, 0x27F),
+  24 (what Direct3D 9 sets unless a game asks it not to) and 64 (Delphi's
+  default, and MinGW's), in each rounding direction, with x87's exponent
+  range, tiny and huge results, NaN rules, and the default NaN for invalid
+  operands (unnormals, pseudo-NaNs, an empty register). Values a double holds
+  take the host's double arithmetic at 24 and 53 bits; the rest, and all of
+  64-bit precision, take integer arithmetic on the 64-bit significands.
+  `FSCALE`, `FRNDINT`, `FXTRACT`, conversions and comparisons are exact too.
+  Transcendental results (`FSIN`, `FPTAN`, `FYL2X`, `F2XM1`...) are double's,
+  which can differ from the x87's in the last bit or two (the x87 does not
+  round these correctly either, and Intel's and AMD's differ); far from zero,
+  `FSIN` and the like reduce their argument exactly, where the x87 uses a
+  66-bit pi;
 - **MMX**, on the x87 registers as the hardware aliases them, with the integer
   SSE additions to it (`PSHUFW`, `PSADBW`, `PMINUB`...) and the MMX conversions;
 - SSE, SSE2, SSE3, `PSHUFB` and `PALIGNR`;
@@ -186,8 +197,15 @@ and exports the `BTCpu` entry points `wow64.dll` looks up, as Wine's
   `NtQueryInformationProcess(ProcessWineIosWowGuestBase)`, as for Madeira's
   other WoW64 code; on upstream Wine the query fails and B is 0.
 
-Not yet: it has not run in Wine (step 2 above). Another thread's
-`GetThreadContext` sees the registers as of that thread's last system call.
+- On an x86-64 host, Wine keeps a 32-bit thread's x87, MMX and SSE registers
+  in the processor rather than the CPU area (that is where `wow64cpu.dll`
+  leaves them), so the module puts the program's there while 64-bit code runs
+  for it and takes them back after. On ARM64, as in Madeira, they are in the
+  CPU area like the rest.
+
+Another thread's `GetThreadContext` sees the registers as of that thread's
+last system call: Wine does not ask the CPU module when it suspends a thread,
+and FEX's module in Madeira has the same limit today.
 
 ## Testing
 
@@ -216,11 +234,31 @@ runner) does what the host it runs on allows:
 - **With mingw-w64 GCC, or clang with lld:** builds the WoW64 CPU module and
   checks what it imports and exports.
 
+`python3 tests/host/check-wow64interp-wine.py WINE_BUILD_DIR` (not in CI:
+it needs a Wine built for x86-64 Linux with `--enable-archs=i386,x86_64`,
+about an hour's build) installs `wow64interp.dll` in a new prefix and runs two
+32-bit programs with `wow64cpu.dll`, on the processor, and with
+`wow64interp.dll`, and compares what they print. `wowtest.c` raises
+exceptions from the processor (access violations, a divide error, `INT3`,
+`UD2`, `INTO`, a stack overflow) and resumes from a changed context, checks
+the registers its handler sees, and runs threads with atomics, x87 math through
+msvcrt, 64-bit division, files and sockets (system and unix calls);
+`workloads-main.c` runs the engine check's 32-bit programs. Every line is the
+same, except that msvcrt's transcendental results are compared to 1e-13. A
+simple loop there runs about 60 times slower interpreted than on the
+processor: 40 to 50 million instructions a second.
+
 During development the 64-bit fuzzer ran 3.3 million comparisons over four
 seeds and the 32-bit one 1.19 million over five, with no difference, on
 x86-64 and replayed on ARM64. Deliberate bugs (a wrong flag, a NaN rule, a
 conversion result, the x87 `DC` operand order, `FIST` rounding, `FCOM`'s
 condition codes, an MMX unpack, `PUSHA`'s ESP and others) were each caught.
+The 32-bit fuzzer's x87 arithmetic snippets also run from any 80-bit values
+(full significands, every exponent, denormals, NaNs, unsupported encodings)
+at random precision and rounding control: 2 million comparisons over six seeds
+with no difference, and eleven deliberate bugs in the exact arithmetic (ties to
+even, a sticky bit, denormals, overflow, a square root's last bit, the sign of
+an exact zero...) each caught.
 
 `tests/x64-interp/gen-selfcheck.py` rebuilds the programs and
 `app/Madeira/NoJITSelfCheckData.h` (it runs them natively, so it needs x86-64

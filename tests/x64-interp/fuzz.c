@@ -263,19 +263,19 @@ static int run_or_record(long trials, const char *filter, FILE *record)
 #endif
 
 
-// x87 registers equal, or (APPROX) equal as doubles to about 9 digits. A native
-// result outside double's exponent range is not compared: the interpreter's
-// arithmetic is double's (docs/NO-JIT.md).
+// x87 registers equal, or (APPROX) equal as doubles to about 9 digits; a
+// transcendental's native result outside double's exponent range is not
+// compared: the interpreter computes them in double (docs/NO-JIT.md).
 static bool f80_close(const uint8_t *a, const uint8_t *b, bool approx)
 {
     if (!memcmp(a, b, 10)) return true;
+    if (!approx) return false;
     uint64_t ma, mb;
     uint16_t ea, eb;
     memcpy(&ma, a, 8); memcpy(&ea, a + 8, 2);
     memcpy(&mb, b, 8); memcpy(&eb, b + 8, 2);
     int native_exponent = (eb & 0x7fff) - 16383;
     if (mb && (eb & 0x7fff) != 0x7fff && (native_exponent > 1023 || native_exponent < -1022)) return true;
-    if (!approx) return false;
     long double x = ldexpl((long double)ma, (ea & 0x7fff) - 16383 - 63), y = ldexpl((long double)mb, (eb & 0x7fff) - 16383 - 63);
     if (ea & 0x8000) x = -x;
     if (eb & 0x8000) y = -y;
@@ -384,7 +384,23 @@ static int replay32(FILE *f)
                 failures++;
                 if (!template_failures) failed_templates++;
                 template_failures++;
-                if (template_failures == 1) fprintf(stderr, "FAIL [%s]%s\n", name, why);
+                if (template_failures == 1) {
+                    fprintf(stderr, "FAIL [%s]%s\n", name, why);
+                    if (flags & (X87 | MMX)) {   // the x87 input: control word and the stack from ST0
+                        uint16_t cw, sw;
+                        memcpy(&cw, IN32->fx, 2); memcpy(&sw, IN32->fx + 2, 2);
+                        fprintf(stderr, "  input fcw %04x tags %02x:", cw, IN32->fx[4]);
+                        for (int i = 0; i < 4; i++) {
+                            const uint8_t *r = IN32->fx + 32 + 16 * i;
+                            uint64_t m; uint16_t e;
+                            memcpy(&m, r, 8); memcpy(&e, r + 8, 2);
+                            fprintf(stderr, " st%d %04x:%016llx", i, e, (unsigned long long)m);
+                        }
+                        uint32_t m32; uint64_t m64; uint32_t i32;
+                        memcpy(&m32, (void *)(MEM + 0x1010), 4); memcpy(&m64, (void *)(MEM + 0x1010), 8); memcpy(&i32, (void *)(MEM + 0x1018), 4);
+                        fprintf(stderr, " [esi+16] %08x / %016llx [esi+24] %08x\n", m32, (unsigned long long)m64, i32);
+                    }
+                }
             }
         }
     }

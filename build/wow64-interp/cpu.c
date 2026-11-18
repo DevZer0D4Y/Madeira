@@ -202,6 +202,37 @@ static bool is_bop(void *user, uint64_t target)
     return target == bop_syscall || target == bop_unix;
 }
 
+#ifdef __x86_64__
+// On an x86-64 host, Wine keeps a 32-bit thread's x87, MMX and SSE registers in
+// the processor, where wow64cpu leaves them: ntdll reads and writes them in the
+// system call frame, not in the CPU area. So the 32-bit program's are in the
+// processor whenever 64-bit code runs for it, and are taken back after; the
+// interpreter's own are put back around that. (On ARM64, as in Madeira, the CPU
+// area holds them like the other registers.)
+typedef struct {
+    _Alignas(16) uint8_t host[512];
+    _Alignas(16) uint8_t guest[512];
+} FPU_SWAP;
+
+static void fpu_to_processor(const X64State *s, FPU_SWAP *swap)
+{
+    __asm__ volatile("fxsave64 %0" : "=m"(swap->host));
+    x64_fxsave(s, swap->guest);
+    uint32_t mxcsr;
+    memcpy(&mxcsr, swap->guest + 24, 4);
+    mxcsr &= 0xffff;   // a reserved bit would fault
+    memcpy(swap->guest + 24, &mxcsr, 4);
+    __asm__ volatile("fxrstor64 %0" : : "m"(swap->guest));
+}
+
+// The processor's registers into swap->guest, and the interpreter's back.
+static void fpu_from_processor(FPU_SWAP *swap)
+{
+    __asm__ volatile("fxsave64 %0" : "=m"(swap->guest));
+    __asm__ volatile("fxrstor64 %0" : : "m"(swap->host));
+}
+#endif
+
 // An exception the interpreter found (INT3, an illegal instruction...), raised
 // on the 32-bit side at `eip` (`address`: where the record says it happened).
 static void raise_guest(X64State *s, CPU_AREA *cpu, NTSTATUS code, uint32_t eip, uint32_t address,
@@ -211,7 +242,7 @@ static void raise_guest(X64State *s, CPU_AREA *cpu, NTSTATUS code, uint32_t eip,
     CONTEXT context;
     EXCEPTION_POINTERS pointers = { &record, &context };
     memset(&record, 0, sizeof record);
-    memset(&context, 0, sizeof context);   // no 64-bit state for wow64 to copy
+    memset(&context, 0, sizeof context);   // no 64-bit state for wow64 to copy...
     s->rip = eip;
     store_state(&cpu->Context, s);
     record.ExceptionCode = (DWORD)code;
@@ -219,9 +250,22 @@ static void raise_guest(X64State *s, CPU_AREA *cpu, NTSTATUS code, uint32_t eip,
     record.NumberParameters = parameters;
     record.ExceptionInformation[0] = p0;
     record.ExceptionInformation[1] = p1;
+#ifdef __x86_64__
+    // ...but the x87 and SSE registers, which wow64 hands the 32-bit handler from here on x86-64.
+    context.ContextFlags = CONTEXT_FLOATING_POINT;
+    x64_fxsave(s, &context.FltSave);
+    FPU_SWAP swap;
+    fpu_to_processor(s, &swap);
+#endif
     Wow64PassExceptionToGuest(&pointers);   // points the 32-bit context at KiUserExceptionDispatcher
+#ifdef __x86_64__
+    fpu_from_processor(&swap);
+#endif
     cpu->Flags &= (USHORT)~WOW64_CPURESERVED_FLAG_RESET_STATE;
     load_state(s, &cpu->Context);
+#ifdef __x86_64__
+    x64_fxrstor(s, swap.guest);
+#endif
 }
 
 // After a call to the 64-bit side: wow64 or ntdll may have replaced the context
@@ -237,6 +281,21 @@ static void returned(X64State *s, CPU_AREA *cpu, NTSTATUS status)
     }
 }
 
+// A system call or unix call on the 64-bit side.
+#ifdef __x86_64__
+#define CALL_64(s, cpu, call)                     \
+    do {                                          \
+        FPU_SWAP swap_;                           \
+        fpu_to_processor(s, &swap_);              \
+        NTSTATUS status_ = (call);                \
+        fpu_from_processor(&swap_);               \
+        returned(s, cpu, status_);                \
+        x64_fxrstor(s, swap_.guest);              \
+    } while (0)
+#else
+#define CALL_64(s, cpu, call) returned(s, cpu, (call))
+#endif
+
 void WINAPI BTCpuSimulate(void)
 {
     CPU_AREA *cpu = cpu_area();
@@ -245,6 +304,17 @@ void WINAPI BTCpuSimulate(void)
     X64Env env = { .stop_rip = ~0ull, .is_native = is_bop, .user = NULL };
     load_state(&s, &cpu->Context);
     cpu->Flags &= (USHORT)~WOW64_CPURESERVED_FLAG_RESET_STATE;
+#ifdef __x86_64__
+    {   // The 32-bit program's x87 and SSE registers are in the processor (FPU_SWAP); the
+        // interpreter's own are x86-64 Windows' defaults.
+        FPU_SWAP swap;
+        uint16_t fcw = 0x27f;
+        uint32_t mxcsr = 0x1f80;
+        __asm__ volatile("fxsave64 %0" : "=m"(swap.guest));
+        x64_fxrstor(&s, swap.guest);
+        __asm__ volatile("fninit\n\tfldcw %0\n\tldmxcsr %1" : : "m"(fcw), "m"(mxcsr));
+    }
+#endif
 
     for (;;) {
         X64ExitInfo info;
@@ -260,7 +330,7 @@ void WINAPI BTCpuSimulate(void)
                 s.rip = read32(esp);
                 s.gpr[X64_RSP] = esp + 4;
                 store_state(&cpu->Context, &s);
-                returned(&s, cpu, Wow64SystemServiceEx((UINT)s.gpr[X64_RAX], (UINT *)host(esp + 8)));
+                CALL_64(&s, cpu, Wow64SystemServiceEx((UINT)s.gpr[X64_RAX], (UINT *)host(esp + 8)));
                 continue;
             }
             if ((uint32_t)s.rip == bop_unix && unix_call_dispatcher) {
@@ -270,7 +340,7 @@ void WINAPI BTCpuSimulate(void)
                 s.rip = read32(esp);
                 s.gpr[X64_RSP] = esp + 20;
                 store_state(&cpu->Context, &s);
-                returned(&s, cpu, unix_call_dispatcher(handle, code, args ? host(args) : NULL));
+                CALL_64(&s, cpu, unix_call_dispatcher(handle, code, args ? host(args) : NULL));
                 continue;
             }
             raise_guest(&s, cpu, STATUS_ILLEGAL_INSTRUCTION, eip, eip, 0, 0, 0);
@@ -284,7 +354,7 @@ void WINAPI BTCpuSimulate(void)
             case 0x29: raise_guest(&s, cpu, STATUS_STACK_BUFFER_OVERRUN, (uint32_t)s.rip, eip, 1, (ULONG_PTR)(uint32_t)s.gpr[X64_RCX], 0); break;
             case 0x2c: raise_guest(&s, cpu, STATUS_ASSERTION_FAILURE, (uint32_t)s.rip, eip, 0, 0, 0); break;
             case 0x2d: raise_guest(&s, cpu, STATUS_BREAKPOINT, (uint32_t)s.rip, eip, 1, (ULONG_PTR)(uint32_t)s.gpr[X64_RAX], 0); break;
-            case 4: raise_guest(&s, cpu, STATUS_INTEGER_OVERFLOW, (uint32_t)s.rip, eip, 0, 0, 0); break;
+            case 4: raise_guest(&s, cpu, STATUS_INTEGER_OVERFLOW, (uint32_t)s.rip, (uint32_t)s.rip, 0, 0, 0); break;   // a trap
             default:   // #GP on Windows: an access violation at 0xffffffff, which wow64 converts back from host
                 raise_guest(&s, cpu, STATUS_ACCESS_VIOLATION, eip, eip, 2, 0, (ULONG_PTR)host(0xffffffff));
                 break;
@@ -325,8 +395,12 @@ NTSTATUS WINAPI BTCpuResetToConsistentState(EXCEPTION_POINTERS *pointers)
 #ifdef __x86_64__
     // On an x86-64 host, wow64.dll gives the 32-bit handler the x87, MMX and SSE
     // registers from this 64-bit context, as they would be after a fault in real
-    // 32-bit code: here they are the interpreter's, so put the guest's there.
+    // 32-bit code: here they are the interpreter's, so put the guest's there, and
+    // in the processor, where they stay while the exception is dispatched and
+    // BTCpuSimulate takes them back (FPU_SWAP).
     x64_fxsave(s, &pointers->ContextRecord->FltSave);
+    FPU_SWAP swap;
+    fpu_to_processor(s, &swap);
 #endif
     slot->running = 0;
     return STATUS_SUCCESS;

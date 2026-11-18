@@ -1483,10 +1483,11 @@ static bool lockable(int map, uint8_t op)
 // x87 and MMX
 //
 // Registers keep all 80 bits through loads, stores, moves, integer
-// conversions and comparisons. Arithmetic converts to double, which matches
-// Windows' default precision control (53-bit, control word 0x27F) for values in
-// double's range; transcendental results are double's. Rounding follows the
-// control word's RC; exceptions are not raised and their flags are not set.
+// conversions and comparisons. FADD, FSUB, FMUL, FDIV and FSQRT round as the
+// control word says, to 24, 53 or 64 bits (precision control) in the rounding
+// control's direction, with x87's exponent range: exactly, as the x87 does
+// (f80_arith). Transcendental results are double's. Exceptions are not raised
+// and their flags are not set.
 
 #define FSW_C0 0x0100
 #define FSW_C1 0x0200
@@ -1532,7 +1533,14 @@ static inline void x87_pop(X64State *s)
     x87_set_top(s, t + 1);
 }
 
-static inline bool f80_nan(X87Reg v) { return (v.exponent & 0x7fff) == 0x7fff && (v.mantissa << 1); }
+static inline bool f80_nan(X87Reg v) { return (v.exponent & 0x7fff) == 0x7fff && (v.mantissa >> 63) && (v.mantissa << 1); }
+// Encodings the x87 has refused as operands since the 387 (an invalid operation):
+// pseudo-NaNs and pseudo-infinities (exponent all ones, no integer bit) and unnormals.
+static inline bool f80_unsupported(X87Reg v)
+{
+    int e = v.exponent & 0x7fff;
+    return e && !(v.mantissa >> 63);
+}
 static inline bool f80_neg(X87Reg v) { return (v.exponent & 0x8000) != 0; }
 static inline X87Reg f80_quiet(X87Reg v) { v.mantissa |= 0x4000000000000000ull; return v; }
 
@@ -1596,6 +1604,7 @@ static inline int64_t f80_signed_half(X87Reg v)
 static double f80_to_double(X87Reg v)
 {
     int e = v.exponent & 0x7fff;
+    if (f80_unsupported(v)) return u2d(0xfff8000000000000ull);   // the default NaN
     if (e == 0x7fff) {
         if (!(v.mantissa << 1)) return f80_neg(v) ? -INFINITY : INFINITY;
         return u2d((f80_neg(v) ? 0x8000000000000000ull : 0) | 0x7ff8000000000000ull | ((v.mantissa >> 11) & 0x0007ffffffffffffull));
@@ -1609,6 +1618,7 @@ static uint32_t f80_to_f32(X87Reg v)
 {
     int e = v.exponent & 0x7fff;
     uint32_t sign = f80_neg(v) ? 0x80000000u : 0;
+    if (f80_unsupported(v)) return 0xffc00000u;
     if (e == 0x7fff) {
         if (!(v.mantissa << 1)) return sign | 0x7f800000u;
         return sign | 0x7fc00000u | (uint32_t)((v.mantissa >> 40) & 0x3fffff);
@@ -1626,7 +1636,7 @@ static bool f80_round(X87Reg v, int rc, uint64_t *magnitude)
 {
     int e = v.exponent & 0x7fff;
     bool neg = f80_neg(v);
-    if (e == 0x7fff) return false;
+    if (e == 0x7fff || f80_unsupported(v)) return false;
     if (!v.mantissa) { *magnitude = 0; return true; }
     int ue = (e ? e : 1) - 16383;   // value = mantissa * 2^(ue - 63)
     if (ue >= 63) {
@@ -1671,7 +1681,7 @@ static bool f80_to_int(X87Reg v, int rc, int64_t *out)
 // -1 less, 0 equal, 1 greater, 2 unordered; exact on all 80 bits.
 static int f80_cmp(X87Reg a, X87Reg b)
 {
-    if (f80_nan(a) || f80_nan(b)) return 2;
+    if (f80_nan(a) || f80_nan(b) || f80_unsupported(a) || f80_unsupported(b)) return 2;
     bool az = !a.mantissa, bz = !b.mantissa;
     bool an = f80_neg(a), bn = f80_neg(b);
     if (az && bz) return 0;
@@ -1683,32 +1693,243 @@ static int f80_cmp(X87Reg a, X87Reg b)
     return an ? -m : m;
 }
 
+// --- Exact x87 arithmetic --------------------------------------------------
+//
+// Values that doubles hold exactly take the host's double arithmetic at 24 and
+// 53 bits, when the result is a normal double too: it rounds the same way, in
+// the host's rounding mode, which x87() sets from the control word, and a double
+// result rounded again to 24 bits is the correctly rounded one (53 >= 2 * 24 + 2).
+// Everything else, and all of 64-bit precision, takes integer arithmetic on the
+// 64-bit significands, rounded once by f80_pack.
+
+typedef unsigned __int128 u128;
+
+enum { F80_ZERO, F80_FINITE, F80_INF, F80_NAN, F80_BAD };
+
+typedef struct {
+    int kind;
+    bool neg;
+    int32_t exp2;    // F80_FINITE: the value is m * 2^exp2
+    uint64_t m;
+} F80Parts;
+
+static F80Parts f80_parts(X87Reg v)
+{
+    F80Parts p = { F80_FINITE, f80_neg(v), 0, v.mantissa };
+    int e = v.exponent & 0x7fff;
+    bool integer = (v.mantissa >> 63) != 0;
+    if (e == 0x7fff) p.kind = !integer ? F80_BAD : (v.mantissa << 1) ? F80_NAN : F80_INF;   // pseudo-NaN, pseudo-infinity
+    else if (e && !integer) p.kind = F80_BAD;                                               // unnormal
+    else if (!v.mantissa) p.kind = F80_ZERO;
+    else p.exp2 = (e ? e : 1) - 16383 - 63;                                                 // denormals: as exponent 1
+    return p;
+}
+
+static int x87_precision(uint16_t fcw)
+{
+    int pc = (fcw >> 8) & 3;
+    return pc == 0 ? 24 : pc == 2 ? 53 : 64;
+}
+
+static inline int clz128(u128 v)   // v != 0
+{
+    uint64_t hi = (uint64_t)(v >> 64);
+    return hi ? __builtin_clzll(hi) : 64 + __builtin_clzll((uint64_t)v);
+}
+
+static X87Reg f80_signed(bool neg, uint16_t exponent, uint64_t mantissa)
+{
+    X87Reg r = { mantissa, (uint16_t)(exponent | (neg ? 0x8000 : 0)), { 0, 0, 0 } };
+    return r;
+}
+
+// sig * 2^exp2 (sig != 0; sticky: the exact value has more below sig's last
+// bit), rounded to `bits` significant bits in direction rc. A tiny result is
+// denormalized first and rounded at the same bit positions; an overflow gives
+// infinity or the largest finite value, as rc says (both as masked exceptions do).
+static X87Reg f80_pack(bool neg, int32_t exp2, u128 sig, bool sticky, int bits, int rc)
+{
+    int lz = clz128(sig);
+    sig <<= lz;
+    int32_t e = exp2 - lz + 127 + 16383;   // the biased exponent of sig's bit 127
+    if (e < 1) {
+        int32_t shift = 1 - e;
+        if (shift >= 128) { sticky = true; sig = 0; }
+        else { sticky = sticky || (sig << (128 - shift)) != 0; sig >>= shift; }
+        e = 1;
+    }
+    u128 unit = (u128)1 << (128 - bits), low = sig & (unit - 1), half = unit >> 1;
+    u128 kept = sig - low;
+    bool inexact = low || sticky, up;
+    switch (rc & 3) {
+    case 0: up = low > half || (low == half && (sticky || (kept & unit))); break;
+    case 1: up = neg && inexact; break;
+    case 2: up = !neg && inexact; break;
+    default: up = false; break;
+    }
+    if (up) {
+        kept += unit;
+        if (!kept) { kept = (u128)1 << 127; e++; }   // carried out of the top
+    }
+    if (e >= 0x7fff) {
+        if (rc == 0 || (rc == 1 && neg) || (rc == 2 && !neg)) return f80_signed(neg, 0x7fff, 0x8000000000000000ull);
+        return f80_signed(neg, 0x7ffe, ~0ull << (64 - bits));
+    }
+    uint64_t m = (uint64_t)(kept >> 64);
+    return f80_signed(neg, (uint16_t)((m >> 63) ? e : 0), m);   // a denormal (or zero) below exponent 1
+}
+
+// Whether a double holds v exactly: zero, infinity, or a normal double.
+static bool f80_is_double(X87Reg v)
+{
+    int e = v.exponent & 0x7fff;
+    if (e == 0x7fff) return v.mantissa == 0x8000000000000000ull;
+    if (!v.mantissa) return e == 0;
+    return (v.mantissa >> 63) && !(v.mantissa & 0x7ff) && e >= 16383 - 1022 && e <= 16383 + 1023;
+}
+
+// To `bits` bits (24), in the x87's exponent range.
+static X87Reg f80_to_precision(X87Reg v, int bits, int rc)
+{
+    F80Parts p = f80_parts(v);
+    return p.kind == F80_FINITE ? f80_pack(p.neg, p.exp2, p.m, false, bits, rc) : v;
+}
+
+static uint64_t isqrt128(u128 n, u128 *remainder)
+{
+    u128 rem = 0;
+    uint64_t root = 0;
+    for (int i = 0; i < 64; i++) {
+        rem = (rem << 2) | (n >> 126);
+        n <<= 2;
+        u128 trial = ((u128)root << 2) | 1;
+        root <<= 1;
+        if (rem >= trial) { rem -= trial; root |= 1; }
+    }
+    *remainder = rem;
+    return root;
+}
+
+static X87Reg f80_sqrt(X87Reg a, uint16_t fcw)
+{
+    F80Parts x = f80_parts(a);
+    int bits = x87_precision(fcw), rc = (fcw >> 10) & 3;
+    switch (x.kind) {
+    case F80_BAD: return F80_INDEFINITE;
+    case F80_NAN: return f80_quiet(a);
+    case F80_ZERO: return a;                                  // -0 too
+    case F80_INF: return x.neg ? F80_INDEFINITE : a;
+    }
+    if (x.neg) return F80_INDEFINITE;
+    if (bits != 64 && f80_is_double(a)) {
+        volatile double r = sqrt(f80_to_double(a));            // never tiny, never overflows
+        X87Reg v = f80_from_f64(d2u(r));
+        return bits == 24 ? f80_to_precision(v, 24, rc) : v;
+    }
+    int lz = __builtin_clzll(x.m);
+    uint64_t m = x.m << lz;
+    int32_t e = x.exp2 - lz;
+    int k = (e & 1) ? 63 : 64;                                // an even exponent left over
+    u128 n = (u128)m << k, rem;
+    uint64_t root = isqrt128(n, &rem);
+    // What is below the root's last bit: above a half when rem > root ((root + 1/2)^2 = root^2 + root + 1/4).
+    u128 sig = ((u128)root << 64) | (rem > root ? ((u128)1 << 63) | 1 : rem ? 1 : 0);
+    return f80_pack(false, (e - k) / 2 - 64, sig, false, bits, rc);
+}
+
 enum { X87_ADD, X87_MUL, X87_COM, X87_COMP, X87_SUB, X87_SUBR, X87_DIV, X87_DIVR };
 
 // `a` is the destination: SUB is a - b, SUBR b - a.
-static X87Reg f80_arith(int op, X87Reg a, X87Reg b)
+static X87Reg f80_arith(int op, X87Reg a, X87Reg b, uint16_t fcw)
 {
+    F80Parts x = f80_parts(a), y = f80_parts(b);
+    if (x.kind == F80_BAD || y.kind == F80_BAD) return F80_INDEFINITE;
     bool na = f80_nan(a), nb = f80_nan(b);
     if (na || nb) {
         if (na && nb) {
             bool qa = (a.mantissa >> 62) & 1, qb = (b.mantissa >> 62) & 1;
             if (qa != qb) return qa ? a : b;   // a QNaN over an SNaN
-            return f80_quiet((a.mantissa << 1) >= (b.mantissa << 1) ? a : b);
+            uint64_t ma = a.mantissa << 1, mb = b.mantissa << 1;
+            if (ma != mb) return f80_quiet(ma > mb ? a : b);   // the larger significand
+            return f80_quiet(f80_neg(a) ? b : a);              // equal ones: the positive NaN
         }
         return f80_quiet(na ? a : b);
     }
-    double x = f80_to_double(a), y = f80_to_double(b);
-    volatile double r;
-    switch (op) {
-    case X87_ADD: r = x + y; break;
-    case X87_MUL: r = x * y; break;
-    case X87_SUB: r = x - y; break;
-    case X87_SUBR: r = y - x; break;
-    case X87_DIV: r = x / y; break;
-    default: r = y / x; break;
+    if (op == X87_SUBR || op == X87_DIVR) {
+        F80Parts t = x; x = y; y = t;
+        X87Reg u = a; a = b; b = u;
+        op = op == X87_SUBR ? X87_SUB : X87_DIV;
     }
-    uint64_t bits = d2u(r);
-    return f64_nan(bits) ? F80_INDEFINITE : f80_from_f64(bits);
+    int bits = x87_precision(fcw), rc = (fcw >> 10) & 3;
+
+    if (bits != 64 && f80_is_double(a) && f80_is_double(b)) {
+        double p = f80_to_double(a), q = f80_to_double(b);
+        volatile double r = op == X87_ADD ? p + q : op == X87_SUB ? p - q : op == X87_MUL ? p * q : p / q;
+        uint64_t rb = d2u(r);
+        if (f64_nan(rb)) return F80_INDEFINITE;               // inf - inf, 0 * inf, 0 / 0, inf / inf
+        // A double result strictly between the smallest and the largest normal double is the
+        // x87's (rounding is monotonic: the exact value is in that range too), and so is a zero or
+        // an infinity that is exact (a sum is zero only exactly); others go the long way.
+        bool special = x.kind != F80_FINITE || y.kind != F80_FINITE;
+        bool normal = fabs(r) > 0x1p-1022 && fabs(r) < 0x1.fffffffffffffp1023;
+        bool exact_zero = r == 0 && (special || op == X87_ADD || op == X87_SUB);
+        bool exact_inf = isinf(r) && (x.kind == F80_INF || y.kind == F80_INF || (op == X87_DIV && y.kind == F80_ZERO));
+        if (normal || exact_zero || exact_inf) {
+            X87Reg v = f80_from_f64(rb);
+            return bits == 24 ? f80_to_precision(v, 24, rc) : v;
+        }
+    }
+
+    bool neg;
+    switch (op) {
+    case X87_ADD: case X87_SUB: {
+        bool yneg = y.neg != (op == X87_SUB);
+        if (x.kind == F80_INF || y.kind == F80_INF) {
+            if (x.kind == F80_INF && y.kind == F80_INF && x.neg != yneg) return F80_INDEFINITE;
+            return f80_signed(x.kind == F80_INF ? x.neg : yneg, 0x7fff, 0x8000000000000000ull);
+        }
+        if (x.kind == F80_ZERO && y.kind == F80_ZERO) return f80_signed(x.neg == yneg ? x.neg : rc == 1, 0, 0);
+        if (y.kind == F80_ZERO) return f80_pack(x.neg, x.exp2, x.m, false, bits, rc);
+        if (x.kind == F80_ZERO) return f80_pack(yneg, y.exp2, y.m, false, bits, rc);
+        // The larger magnitude first: a larger exponent is a normal number, larger than any with a smaller one.
+        bool bneg = x.neg, sneg = yneg;
+        F80Parts big = x, small = y;
+        if (y.exp2 > x.exp2 || (y.exp2 == x.exp2 && y.m > x.m)) { big = y; small = x; bneg = yneg; sneg = x.neg; }
+        int32_t d = big.exp2 - small.exp2;
+        u128 A = (u128)big.m << 62, B = (u128)small.m << 62;
+        bool sticky = false;
+        if (d >= 128) { sticky = true; B = 0; }
+        else if (d) { sticky = (B << (128 - d)) != 0; B >>= d; }
+        u128 sum;
+        if (bneg == sneg) sum = A + B;
+        else sum = A - B - (sticky ? 1 : 0);   // with a sticky bit, the difference is just below A - B
+        if (!sum && !sticky) return f80_signed(rc == 1, 0, 0);
+        return f80_pack(bneg, big.exp2 - 62, sum, sticky, bits, rc);
+    }
+    case X87_MUL:
+        neg = x.neg != y.neg;
+        if (x.kind == F80_INF || y.kind == F80_INF)
+            return x.kind == F80_ZERO || y.kind == F80_ZERO ? F80_INDEFINITE : f80_signed(neg, 0x7fff, 0x8000000000000000ull);
+        if (x.kind == F80_ZERO || y.kind == F80_ZERO) return f80_signed(neg, 0, 0);
+        return f80_pack(neg, x.exp2 + y.exp2, (u128)x.m * y.m, false, bits, rc);
+    default: {   // X87_DIV
+        neg = x.neg != y.neg;
+        if (x.kind == F80_INF) return y.kind == F80_INF ? F80_INDEFINITE : f80_signed(neg, 0x7fff, 0x8000000000000000ull);
+        if (y.kind == F80_INF) return f80_signed(neg, 0, 0);
+        if (y.kind == F80_ZERO) return x.kind == F80_ZERO ? F80_INDEFINITE : f80_signed(neg, 0x7fff, 0x8000000000000000ull);
+        if (x.kind == F80_ZERO) return f80_signed(neg, 0, 0);
+        int lx = __builtin_clzll(x.m), ly = __builtin_clzll(y.m);
+        uint64_t mx = x.m << lx, my = y.m << ly;
+        // 66 quotient bits of mx / my (in [1/2, 2)): 64 significant, one more, and the remainder.
+        u128 r = mx, q = 0;
+        for (int i = 0; i < 66; i++) {
+            q <<= 1;
+            if (r >= my) { r -= my; q |= 1; }
+            r <<= 1;
+        }
+        return f80_pack(neg, (x.exp2 - lx) - (y.exp2 - ly) - 65, q, r != 0, bits, rc);
+    }
+    }
 }
 
 static X87Reg f80_from_double(double r)
@@ -1813,13 +2034,27 @@ static int x87_misc(X64State *s, uint8_t low)
 {
     X87Reg a = x87_get(s, 0), b = x87_get(s, 1);
     double x = f80_to_double(a);
+    // An invalid operand (an unsupported encoding, or an empty register for an instruction with
+    // two) makes the result the default NaN, as the masked invalid-operation response does.
+    bool one = low == 0xF0 || low == 0xF2 || low == 0xF4 || low == 0xFA || low == 0xFB || low == 0xFC || low == 0xFE || low == 0xFF;
+    bool two = low == 0xF1 || low == 0xF3 || low == 0xF5 || low == 0xF8 || low == 0xF9 || low == 0xFD;
+    if ((one && f80_unsupported(a)) ||
+        (two && (f80_unsupported(a) || f80_unsupported(b) || !x87_valid(s, 0) || !x87_valid(s, 1)))) {
+        switch (low) {
+        case 0xF1: case 0xF3: case 0xF9: x87_put(s, 1, F80_INDEFINITE); x87_pop(s); break;   // FYL2X FPATAN FYL2XP1
+        case 0xF2: case 0xF4: case 0xFB: x87_put(s, 0, F80_INDEFINITE); x87_push(s, F80_INDEFINITE); break;   // FPTAN FXTRACT FSINCOS
+        default: x87_put(s, 0, F80_INDEFINITE); break;
+        }
+        if (low != 0xF4 && low != 0xFA && low != 0xFC && low != 0xFD) x87_set_cc(s, 0);
+        return CONT;
+    }
     // A NaN operand comes back quieted (two: as the arithmetic instructions choose).
     switch (low) {
     case 0xF0: case 0xFA: case 0xFE: case 0xFF:                               // F2XM1 FSQRT FSIN FCOS
         if (f80_nan(a)) { x87_put(s, 0, f80_quiet(a)); if (low != 0xFA) x87_set_cc(s, 0); return CONT; }
         break;
     case 0xF1: case 0xF3: case 0xF9:                                          // FYL2X FPATAN FYL2XP1
-        if (f80_nan(a) || f80_nan(b)) { x87_put(s, 1, f80_arith(X87_ADD, a, b)); x87_pop(s); return CONT; }
+        if (f80_nan(a) || f80_nan(b)) { x87_put(s, 1, f80_arith(X87_ADD, a, b, s->fcw)); x87_pop(s); return CONT; }
         break;
     }
     switch (low) {
@@ -1885,7 +2120,7 @@ static int x87_misc(X64State *s, uint8_t low)
     case 0xF6: x87_set_top(s, x87_top(s) - 1); return CONT;                  // FDECSTP
     case 0xF7: x87_set_top(s, x87_top(s) + 1); return CONT;                  // FINCSTP
     case 0xF9: x87_put(s, 1, f80_from_double(f80_to_double(b) * x64m_log1p(x) / LN2)); x87_pop(s); return CONT;   // FYL2XP1
-    case 0xFA: x87_put(s, 0, f80_from_double(sqrt(x))); return CONT;         // FSQRT
+    case 0xFA: x87_put(s, 0, f80_sqrt(a, s->fcw)); return CONT;              // FSQRT
     case 0xFC: {                                                              // FRNDINT
         uint64_t m;
         int e = a.exponent & 0x7fff;
@@ -1895,17 +2130,19 @@ static int x87_misc(X64State *s, uint8_t low)
         return CONT;
     }
     case 0xFD: {                                                              // FSCALE
-        double n = x64m_trunc(f80_to_double(b));
-        int e = a.exponent & 0x7fff;
-        if (f80_nan(a) || f80_nan(b)) { x87_put(s, 0, f80_arith(X87_ADD, a, b)); return CONT; }
-        if ((!a.mantissa && isinf(n) && n > 0) || (e == 0x7fff && isinf(n) && n < 0)) { x87_put(s, 0, F80_INDEFINITE); return CONT; }   // 0 * 2^inf, inf * 2^-inf
-        if (e == 0x7fff || !a.mantissa) { x87_put(s, 0, a); return CONT; }
-        if (n > 100000) n = 100000;
-        if (n < -100000) n = -100000;
-        int ne = e + (int)n;
-        if (e && (a.mantissa >> 63) && ne >= 1 && ne <= 0x7ffe) a.exponent = (uint16_t)((a.exponent & 0x8000) | ne);
-        else a = f80_from_double(scale2(x, (int)n));
-        x87_put(s, 0, a);
+        F80Parts p = f80_parts(a), q = f80_parts(b);
+        if (f80_nan(a) || f80_nan(b)) { x87_put(s, 0, f80_arith(X87_ADD, a, b, s->fcw)); return CONT; }
+        if (q.kind == F80_INF) {   // by an infinity: exact, or invalid for 0 * 2^inf and inf * 2^-inf
+            if ((p.kind == F80_ZERO && !q.neg) || (p.kind == F80_INF && q.neg)) x87_put(s, 0, F80_INDEFINITE);
+            else if (p.kind == F80_FINITE) x87_put(s, 0, f80_signed(p.neg, q.neg ? 0 : 0x7fff, q.neg ? 0 : 0x8000000000000000ull));
+            return CONT;
+        }
+        if (p.kind != F80_FINITE) return CONT;                               // a zero or an infinity stays
+        uint64_t magnitude;                                                   // ST1 truncated, from all 80 bits
+        if (!f80_round(b, 3, &magnitude) || magnitude > 100000) magnitude = 100000;   // beyond any exponent
+        int32_t n = q.neg ? -(int32_t)magnitude : (int32_t)magnitude;
+        // Exact unless the result is tiny or overflows (rounded at 64 bits: precision control does not apply).
+        x87_put(s, 0, f80_pack(p.neg, p.exp2 + n, p.m, false, 64, (s->fcw >> 10) & 3));
         return CONT;
     }
     case 0xD0: return CONT;                                                   // FNOP
@@ -1946,7 +2183,7 @@ static int x87(X64State *s, Dec *d, uint8_t op)
                 x87_compare(s, x87_get(s, 0), v, false);
                 if (d->regf == X87_COMP) x87_pop(s);
             } else {
-                x87_put(s, 0, f80_arith(d->regf, x87_get(s, 0), v));
+                x87_put(s, 0, x87_valid(s, 0) ? f80_arith(d->regf, x87_get(s, 0), v, s->fcw) : F80_INDEFINITE);
             }
             break;
         case 0x08: v = f80_from_f32((uint32_t)mem_read(ea, 4)); x87_push(s, f80_nan(v) ? f80_quiet(v) : v); break;   // FLD m32
@@ -2004,7 +2241,7 @@ static int x87(X64State *s, Dec *d, uint8_t op)
         switch (op) {
         case 0xD8:                                                       // ST0 = ST0 op ST(i)
             if (d->regf == X87_COM || d->regf == X87_COMP) { x87_compare(s, t0, ti, false); if (d->regf == X87_COMP) x87_pop(s); }
-            else x87_put(s, 0, f80_arith(d->regf, t0, ti));
+            else x87_put(s, 0, x87_valid(s, 0) && x87_valid(s, reg) ? f80_arith(d->regf, t0, ti, s->fcw) : F80_INDEFINITE);
             break;
         case 0xDC: case 0xDE:                                            // ST(i) = ST(i) op ST0 (SUB/SUBR and DIV/DIVR swap)
             if (op == 0xDE && d->regf == 3 && reg != 1) { result = X64_EXIT_ILLEGAL; break; }
@@ -2014,7 +2251,8 @@ static int x87(X64State *s, Dec *d, uint8_t op)
                 if (op == 0xDE && d->regf == 3) x87_pop(s);              // FCOMPP
                 break;
             }
-            x87_put(s, reg, f80_arith(d->regf >= 4 ? d->regf ^ 1 : d->regf, ti, t0));
+            x87_put(s, reg, x87_valid(s, 0) && x87_valid(s, reg) ? f80_arith(d->regf >= 4 ? d->regf ^ 1 : d->regf, ti, t0, s->fcw)
+                                                                  : F80_INDEFINITE);   // an empty register: stack underflow
             if (op == 0xDE) x87_pop(s);
             break;
         case 0xD9:

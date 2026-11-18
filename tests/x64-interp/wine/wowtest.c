@@ -84,10 +84,14 @@ static unsigned recursion(unsigned n)
 
 static void report(const char *name, const void *label, unsigned result)
 {
-    printf("exception %-9s code %08lx at+%ld eip+%ld params %lu %lx %lx xmm0 %08lx extended %d result %u handled %d\n", name,
-           (unsigned long)seen_code, (long)(seen_address - (DWORD)label), (long)(seen_eip - (DWORD)label),
-           (unsigned long)seen_params, (unsigned long)seen_info0, (unsigned long)seen_info1, (unsigned long)seen_xmm0,
-           (seen_flags & CONTEXT_EXTENDED_REGISTERS) == CONTEXT_EXTENDED_REGISTERS, result, handled);
+    char where[64];
+    if (label)   // the faulting instruction's offset from its label
+        snprintf(where, sizeof where, "at+%ld eip+%ld", (long)(seen_address - (DWORD)label), (long)(seen_eip - (DWORD)label));
+    else         // somewhere in a DLL, whose address can change from run to run
+        snprintf(where, sizeof where, "eip%sat", seen_eip == seen_address ? "==" : "!=");
+    printf("exception %-9s code %08lx %s params %lu %lx %lx xmm0 %08lx extended %d result %u handled %d\n", name,
+           (unsigned long)seen_code, where, (unsigned long)seen_params, (unsigned long)seen_info0, (unsigned long)seen_info1,
+           (unsigned long)seen_xmm0, (seen_flags & CONTEXT_EXTENDED_REGISTERS) == CONTEXT_EXTENDED_REGISTERS, result, handled);
     seen_code = seen_address = seen_eip = seen_params = seen_info0 = seen_info1 = seen_xmm0 = seen_flags = 0;
     handled = 0;
 }
@@ -167,11 +171,15 @@ static int compare(const void *a, const void *b)
 
 static void arithmetic(void)
 {
-    static const double values[] = { 0.5, 1.0, 2.5, 10.0, 1e-3, 123.456, 1e10, -3.75 };
+    // msvcrt's sin, tan, exp, pow... use the x87's transcendental instructions, which are not
+    // correctly rounded (and differ between processors); the interpreter's are double's. These
+    // lines are compared to 1e-13 ("approx"), the rest exactly.
+    static const double values[] = { 0.5, 1.0, 2.5, 10.0, 1e-3, 123.456, 1e6, -3.75 };
     for (unsigned i = 0; i < sizeof values / sizeof *values; i++) {
         double x = values[i];
-        printf("math %.17g: %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", x, sin(x), cos(x), tan(x),
-               sqrt(fabs(x)), exp(x / 8), log(fabs(x)), pow(fabs(x), 1.7), atan2(x, 3.0), fmod(x, 0.7));
+        printf("approx math %.17g: %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", x, sin(x), cos(x), tan(x),
+               exp(x / 8), log(fabs(x)), pow(fabs(x), 1.7), atan2(x, 3.0));
+        printf("math %.17g: sqrt %.17g fmod %.17g floor %.17g\n", x, sqrt(fabs(x)), fmod(x, 0.7), floor(x * 1.37));
     }
     float f = 1.0f;
     long double l = 1.0L;
@@ -265,12 +273,18 @@ static void info(void)
     QueryPerformanceCounter(&end);
     double seconds = (double)(end.QuadPart - start.QuadPart) / (double)frequency.QuadPart;
     printf("info: 20M loop iterations in %.3f s (%u)\n", seconds, (unsigned)sink);
+    // The x87 reduces large arguments with a 66-bit pi: visibly inexact far from zero.
+    volatile double big = 1e10;   // not folded at compile time
+    printf("info: sin(1e10) %.17g cos(1e10) %.17g\n", sin(big), cos(big));
 }
 
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    printf("start\n");
+    unsigned short fcw;
+    unsigned mxcsr;
+    __asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(fcw), "=m"(mxcsr));
+    printf("start: x87 control word %04x, MXCSR %08x\n", fcw, mxcsr);
     exceptions();
     threads();
     arithmetic();

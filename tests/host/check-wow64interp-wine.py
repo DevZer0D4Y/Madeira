@@ -14,7 +14,9 @@ Makes a Wine prefix, installs wow64interp.dll in system32, and runs two 32-bit
 programs from tests/x64-interp/wine twice: with Wine's wow64cpu.dll, which runs
 them on this CPU, and with wow64interp.dll (HKLM\\Software\\Microsoft\\Wow64\\x86
 names the module wow64.dll loads). Every output line not starting with "info:"
-must be the same, and the second run must have loaded wow64interp.dll:
+must be the same (lines starting with "approx" to 1e-13: transcendental results,
+which the x87 does not round correctly), and the second run must have loaded
+wow64interp.dll:
   - wowtest.exe: exceptions from the CPU (access violations, divide error,
     INT3, UD2, INTO, stack overflow) caught and resumed from a changed context,
     RaiseException, threads with atomics, x87 math through msvcrt, 64-bit
@@ -115,10 +117,29 @@ try:
                 if line.startswith('info:'):
                     print(f'      {cpu}: {line}')
 
+    def same(a, b):
+        if a == b:
+            return True
+        if not (a.startswith('approx ') and b.startswith('approx ')):
+            return False
+        x, y = a.split(), b.split()   # numbers to 1e-13
+        if len(x) != len(y):
+            return False
+        for p, q in zip(x, y):
+            try:
+                u, v = float(p.rstrip(':')), float(q.rstrip(':'))
+            except ValueError:
+                if p != q:
+                    return False
+                continue
+            if u != v and abs(u - v) > 1e-13 * max(abs(u), abs(v)):
+                return False
+        return True
+
     for name in programs:
         native = [line for line in outputs['wow64cpu.dll', name] if not line.startswith('info:')]
         interpreted = [line for line in outputs['wow64interp.dll', name] if not line.startswith('info:')]
-        differences = [f'  wow64cpu:    {a}\n  wow64interp: {b}' for a, b in zip(native, interpreted) if a != b]
+        differences = [f'  wow64cpu:    {a}\n  wow64interp: {b}' for a, b in zip(native, interpreted) if not same(a, b)]
         if len(native) != len(interpreted):
             differences.append(f'  {len(native)} lines against {len(interpreted)}')
         check(native and not differences and native[-1] == ('done' if name == 'wowtest' else native[-1]),

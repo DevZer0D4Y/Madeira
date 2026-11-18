@@ -15,7 +15,7 @@ ARITH = CF | PF | AF | ZF | SF | OF
 # Template flags, matched in fuzz-common.h.
 (RCX_SMALL, R8_SMALL, BITOFF, POPF, XLAT, APPROX, NOMEM, SSE, RCX17, DIV) = (1 << i for i in range(10))
 X87, MMX, X87RC, FSWAX, CMPC1, X87INT = (1 << i for i in range(10, 16))
-X87NEAR, X87UNIT = 1 << 22, 1 << 23
+X87NEAR, X87UNIT, X87FULL = 1 << 22, 1 << 23, 1 << 24
 
 
 def div(size, signed, mem=False):
@@ -191,6 +191,22 @@ X('fnstenv [edi]; fldenv [edi]', 0, NOMEM)
 X('fnsave [edi]; frstor [edi]', 0, NOMEM)
 X('fnsave [edi]; fld1; frstor [edi]', 0, NOMEM)
 X('fld st(0); fmul st, st(1); fadd st(2), st; fst qword ptr [edi]; fistp dword ptr [edi+8]', 0, X87NEAR)
+# Arithmetic on any 80-bit values at 24-, 53- and 64-bit precision, in every rounding direction.
+F = lambda asm: X(asm, 0, X87FULL)
+for op in ['fadd', 'fmul', 'fsub', 'fsubr', 'fdiv', 'fdivr']:
+    F(f'{op} st, st(1)')
+    F(f'{op} st(1), st')
+    F(f'{op}p st(1), st')
+    for size in ['dword', 'qword']:
+        F(f'{op} {size} ptr [esi+16]')
+    F(f'fi{op[1:]} dword ptr [esi+24]')
+for i in ['fsqrt', 'fscale', 'frndint', 'fxtract', 'fst dword ptr [edi]', 'fst qword ptr [edi]', 'fstp tbyte ptr [edi]',
+          'fist dword ptr [edi]', 'fistp qword ptr [edi]', 'fld st(0); fmul st, st(1); fadd st(2), st; fdiv st, st(3); fsqrt; fsub st, st(1)']:
+    F(i)
+F('fld st(0); fsub st, st(1)')                      # exact zeros: their sign follows the rounding control
+F('fld st(0); fchs; fadd st, st(1)')
+X('fcom st(1); fnstsw ax', 0, X87FULL | FSWAX)
+X('fxam; fnstsw ax', 0, X87FULL | FSWAX | CMPC1)
 
 # --- MMX -------------------------------------------------------------------------------
 M = lambda asm, undef=0, flags=0: t(asm, undef, flags | MMX)

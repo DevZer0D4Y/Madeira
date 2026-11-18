@@ -34,6 +34,9 @@ static uint8_t buffer[65536];
 int main(void)
 {
     static const uint64_t seeds[] = { 0x1, 0x5eed1234cafef00dull, 0x0123456789abcdefull };
+    unsigned short fcw;
+    __asm__ volatile("fnstcw %0" : "=m"(fcw));
+    printf("x87 control word %04x\n", fcw);
     for (unsigned i = 0; i < sizeof entries / sizeof *entries; i++) {
         for (unsigned j = 0; j < sizeof seeds / sizeof *seeds; j++) {
             memset(buffer, 0, sizeof buffer);
