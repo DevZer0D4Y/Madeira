@@ -30,11 +30,12 @@
 
 #include "X64Interpreter.h"
 
-#include <fenv.h>
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(__x86_64__) && !defined(__i386__) && !defined(__aarch64__)
+#include <fenv.h>
+#endif
 
 #if defined(__clang__)
 #pragma STDC FENV_ACCESS ON
@@ -397,6 +398,22 @@ static bool cond(const X64State *s, int cc)
     return (cc & 1) ? !r : r;
 }
 
+// (hi:lo) / d with hi < d, so the quotient fits 64 bits: long division a bit at
+// a time, which needs no compiler runtime (a 128-bit "/" does on ARM64 Windows).
+static uint64_t udiv128(uint64_t hi, uint64_t lo, uint64_t d, uint64_t *remainder)
+{
+    uint64_t q = 0;
+    for (int i = 0; i < 64; i++) {
+        bool carry = (hi >> 63) != 0;
+        hi = (hi << 1) | (lo >> 63);
+        lo <<= 1;
+        q <<= 1;
+        if (carry || hi >= d) { hi -= d; q |= 1; }
+    }
+    *remainder = hi;
+    return q;
+}
+
 // Read-modify-write operations, which LOCK makes atomic.
 enum { RMW_ALU, RMW_INC, RMW_DEC, RMW_NOT, RMW_NEG, RMW_BTS, RMW_BTR, RMW_BTC };
 
@@ -533,6 +550,147 @@ static inline uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static inline double u2d(uint64_t u) { double f; memcpy(&f, &u, 8); return f; }
 static inline uint64_t d2u(double f) { uint64_t u; memcpy(&u, &f, 8); return u; }
 
+// ---------------------------------------------------------------------------
+// The host: its rounding mode, a clock, and the libm functions ntdll lacks.
+//
+// The interpreter also builds into a Windows DLL that may import nothing but
+// ntdll (the WoW64 CPU module, build/wow64-interp). So it sets the rounding mode
+// itself, reads time through NtQueryPerformanceCounter there, and has its own
+// trunc, nearbyint, fmod and remainder, which are exact and so agree on every
+// host. sin, cos, tan, atan2, log, pow and sqrt come from libm, or from ntdll's
+// exports of the same functions.
+
+// The host's rounding mode, in x86's RC encoding: 0 nearest, 1 down, 2 up, 3 toward zero.
+static int host_get_rc(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    uint32_t m;
+    __asm__ volatile("stmxcsr %0" : "=m"(m) : : "memory");
+    return (int)((m >> 13) & 3);
+#elif defined(__aarch64__)
+    uint64_t f;   // FPCR.RMode: 0 nearest, 1 up, 2 down, 3 toward zero
+    __asm__ volatile("mrs %0, fpcr" : "=r"(f) : : "memory");
+    int r = (int)((f >> 22) & 3);
+    return r == 1 ? 2 : r == 2 ? 1 : r;
+#else
+    int r = fegetround();
+    return r == FE_DOWNWARD ? 1 : r == FE_UPWARD ? 2 : r == FE_TOWARDZERO ? 3 : 0;
+#endif
+}
+
+static void host_set_rc(int rc)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    uint32_t m;
+    __asm__ volatile("stmxcsr %0" : "=m"(m) : : "memory");
+    m = (m & ~0x6000u) | ((uint32_t)(rc & 3) << 13);
+    __asm__ volatile("ldmxcsr %0" : : "m"(m) : "memory");
+#elif defined(__aarch64__)
+    uint64_t f;
+    int r = rc == 1 ? 2 : rc == 2 ? 1 : rc & 3;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(f) : : "memory");
+    f = (f & ~(3ull << 22)) | ((uint64_t)r << 22);
+    __asm__ volatile("msr fpcr, %0" : : "r"(f) : "memory");
+#else
+    static const int modes[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
+    fesetround(modes[rc & 3]);
+#endif
+}
+
+#if defined(_WIN32)
+extern long __stdcall NtQueryPerformanceCounter(long long *counter, long long *frequency);
+#endif
+
+static uint64_t host_nanoseconds(void)
+{
+#if defined(_WIN32)
+    long long counter = 0, frequency = 1;
+    NtQueryPerformanceCounter(&counter, &frequency);
+    return (uint64_t)((double)counter * (1e9 / (double)frequency));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static double x64m_trunc(double x)
+{
+    uint64_t u = d2u(x);
+    int e = (int)((u >> 52) & 0x7ff) - 1023;
+    if (e >= 52) return x;                                // integral, infinite or NaN
+    if (e < 0) return u2d(u & 0x8000000000000000ull);     // below 1: a signed zero
+    return u2d(u & ~(0x000fffffffffffffull >> e));
+}
+
+// The integer the host's rounding mode gives: adding and taking away 2^52 rounds
+// any |x| < 2^52 to a whole number in that mode.
+static double x64m_nearbyint(double x)
+{
+    if (!(fabs(x) < 0x1p52)) return x;
+    volatile double big = x < 0 ? -0x1p52 : 0x1p52;
+    volatile double r = (x + big) - big;
+    return r == 0 ? copysign(0.0, x) : r;
+}
+
+// Exact, as IEEE 754 defines it: the significands divided bit by bit.
+static double x64m_fmod(double x, double y)
+{
+    uint64_t ux = d2u(x), uy = d2u(y);
+    int ex = (int)((ux >> 52) & 0x7ff), ey = (int)((uy >> 52) & 0x7ff);
+    uint64_t sign = ux & 0x8000000000000000ull;
+    if (!(uy << 1) || isnan(y) || ex == 0x7ff) return (x * y) / (x * y);
+    if ((ux << 1) <= (uy << 1)) return (ux << 1) == (uy << 1) ? 0 * x : x;
+    if (!ex) { for (uint64_t i = ux << 12; !(i >> 63); i <<= 1) ex--; ux <<= -ex + 1; }
+    else ux = (ux & (~0ull >> 12)) | (1ull << 52);
+    if (!ey) { for (uint64_t i = uy << 12; !(i >> 63); i <<= 1) ey--; uy <<= -ey + 1; }
+    else uy = (uy & (~0ull >> 12)) | (1ull << 52);
+    for (; ex > ey; ex--) {
+        uint64_t i = ux - uy;
+        if (!(i >> 63)) { if (!i) return 0 * x; ux = i; }
+        ux <<= 1;
+    }
+    uint64_t i = ux - uy;
+    if (!(i >> 63)) { if (!i) return 0 * x; ux = i; }
+    for (; !(ux >> 52); ux <<= 1) ex--;
+    if (ex > 0) ux = (ux - (1ull << 52)) | ((uint64_t)ex << 52);
+    else ux >>= -ex + 1;
+    return u2d(ux | sign);
+}
+
+// IEEE remainder: x - n*y with n the nearest integer (even on a tie).
+static double x64m_remainder(double x, double y)
+{
+    if (isnan(x) || isnan(y) || isinf(x) || y == 0) return (x * y) / (x * y);
+    bool neg = signbit(x);
+    double ay = fabs(y), r = fabs(x);
+    if (ay <= 0x1p1022) r = x64m_fmod(r, ay + ay);   // |r| < 2|y|
+    if (ay < 0x1p-1021) {
+        if (r + r > ay) { r -= ay; if (r + r >= ay) r -= ay; }
+    } else {
+        double half = 0.5 * ay;
+        if (r > half) { r -= ay; if (r >= half) r -= ay; }
+    }
+    return neg ? -r : r;
+}
+
+static const double LN2 = 0.69314718055994530942;
+
+static double x64m_exp2m1(double x)   // 2^x - 1, for F2XM1's |x| <= 1
+{
+    double t = x * LN2;
+    if (fabs(t) < 1e-5) return t + t * t * 0.5 + t * t * t * (1.0 / 6);
+    return pow(2.0, x) - 1.0;
+}
+
+static double x64m_log1p(double x)
+{
+    volatile double u = 1.0 + x;
+    if (u == 1.0) return x;
+    return log(u) * x / (u - 1.0);
+}
+
+
 #define F32_INDEFINITE 0xffc00000u
 #define F64_INDEFINITE 0xfff8000000000000ull
 
@@ -645,7 +803,7 @@ static uint32_t f64_to_f32(const X64State *s, uint64_t x)
 static uint64_t f_to_int(double v, bool truncate, int size)
 {
     if (isnan(v)) return size == 8 ? 0x8000000000000000ull : 0x80000000ull;
-    double r = truncate ? trunc(v) : nearbyint(v);
+    double r = truncate ? x64m_trunc(v) : x64m_nearbyint(v);
     if (size == 8) {
         if (r < -9223372036854775808.0 || r >= 9223372036854775808.0) return 0x8000000000000000ull;
         return (uint64_t)(int64_t)r;
@@ -679,20 +837,10 @@ static void comis(X64State *s, double a, double b)
     set_flags(s, FL_ARITH, f);
 }
 
-static int host_rounding(uint32_t mxcsr)
-{
-    switch ((mxcsr >> 13) & 3) {
-    case 1: return FE_DOWNWARD;
-    case 2: return FE_UPWARD;
-    case 3: return FE_TOWARDZERO;
-    default: return FE_TONEAREST;
-    }
-}
-
 static void set_mxcsr(X64State *s, uint32_t v)
 {
     s->mxcsr = v & 0xffffu;
-    fesetround(host_rounding(s->mxcsr));
+    host_set_rc((int)((s->mxcsr >> 13) & 3));
 }
 
 // ---------------------------------------------------------------------------
@@ -767,7 +915,10 @@ static bool pint(uint8_t op, X64Vec *a, const X64Vec *b)
     case 0xF6:
         for (i = 0; i < 2; i++) {
             unsigned sum = 0;
-            for (int j = 0; j < 8; j++) sum += (unsigned)abs(a->b[8 * i + j] - b->b[8 * i + j]);
+            for (int j = 0; j < 8; j++) {
+                int diff = a->b[8 * i + j] - b->b[8 * i + j];
+                sum += (unsigned)(diff < 0 ? -diff : diff);
+            }
             r.q[i] = sum;
         }
         break;
@@ -1260,9 +1411,7 @@ static int call(X64State *s, const X64Env *env, uint64_t target, uint64_t ret)
 
 static uint64_t rdtsc(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return host_nanoseconds();
 }
 
 // FXSAVE's 512-byte area: control and status words, the abridged tag byte,
@@ -1659,8 +1808,6 @@ static void x87_store_bcd(const X64State *s, uint64_t addr, X87Reg v)
     memcpy((void *)(uintptr_t)addr, b, 10);
 }
 
-static const double LN2 = 0.69314718055994530942;
-
 // D9 E0-FF and the rest of the register-only one-operand group.
 static int x87_misc(X64State *s, uint8_t low)
 {
@@ -1698,8 +1845,8 @@ static int x87_misc(X64State *s, uint8_t low)
     case 0xEC: x87_push(s, x87_constant(s, 3)); return CONT;                  // FLDLG2
     case 0xED: x87_push(s, x87_constant(s, 4)); return CONT;                  // FLDLN2
     case 0xEE: x87_push(s, (X87Reg){ 0, 0, { 0, 0, 0 } }); return CONT;      // FLDZ
-    case 0xF0: x87_put(s, 0, f80_from_double(expm1(x * LN2))); return CONT;   // F2XM1
-    case 0xF1: x87_put(s, 1, f80_from_double(f80_to_double(b) * log2(x))); x87_pop(s); return CONT;       // FYL2X
+    case 0xF0: x87_put(s, 0, f80_from_double(x64m_exp2m1(x))); return CONT;   // F2XM1
+    case 0xF1: x87_put(s, 1, f80_from_double(f80_to_double(b) * (log(x) / LN2))); x87_pop(s); return CONT;   // FYL2X
     case 0xF2: case 0xFE: case 0xFF: case 0xFB:                               // FPTAN FSIN FCOS FSINCOS
         if (fabs(x) >= 0x1p63 && !isnan(x)) { x87_set_cc(s, FSW_C2); return CONT; }
         x87_set_cc(s, 0);
@@ -1728,16 +1875,16 @@ static int x87_misc(X64State *s, uint8_t low)
     case 0xF5: case 0xF8: {                                                   // FPREM1 FPREM
         double y = f80_to_double(b);
         if (isnan(x) || isnan(y) || isinf(x) || y == 0) { x87_put(s, 0, isnan(x) || isnan(y) ? f80_from_double(x + y) : F80_INDEFINITE); x87_set_cc(s, 0); return CONT; }
-        double r = low == 0xF8 ? fmod(x, y) : remainder(x, y);
-        double q = fabs(nearbyint((x - r) / y));
-        unsigned bits = (unsigned)fmod(q, 8.0);
+        double r = low == 0xF8 ? x64m_fmod(x, y) : x64m_remainder(x, y);
+        double q = fabs(x64m_nearbyint((x - r) / y));
+        unsigned bits = (unsigned)x64m_fmod(q, 8.0);
         x87_set_cc(s, (uint16_t)(((bits & 4) ? FSW_C0 : 0) | ((bits & 2) ? FSW_C3 : 0) | ((bits & 1) ? FSW_C1 : 0)));
         x87_put(s, 0, r == 0 ? (X87Reg){ 0, (uint16_t)(a.exponent & 0x8000), { 0, 0, 0 } } : f80_from_double(r));
         return CONT;
     }
     case 0xF6: x87_set_top(s, x87_top(s) - 1); return CONT;                  // FDECSTP
     case 0xF7: x87_set_top(s, x87_top(s) + 1); return CONT;                  // FINCSTP
-    case 0xF9: x87_put(s, 1, f80_from_double(f80_to_double(b) * log1p(x) / LN2)); x87_pop(s); return CONT;   // FYL2XP1
+    case 0xF9: x87_put(s, 1, f80_from_double(f80_to_double(b) * x64m_log1p(x) / LN2)); x87_pop(s); return CONT;   // FYL2XP1
     case 0xFA: x87_put(s, 0, f80_from_double(sqrt(x))); return CONT;         // FSQRT
     case 0xFC: {                                                              // FRNDINT
         uint64_t m;
@@ -1748,7 +1895,7 @@ static int x87_misc(X64State *s, uint8_t low)
         return CONT;
     }
     case 0xFD: {                                                              // FSCALE
-        double n = trunc(f80_to_double(b));
+        double n = x64m_trunc(f80_to_double(b));
         int e = a.exponent & 0x7fff;
         if (f80_nan(a) || f80_nan(b)) { x87_put(s, 0, f80_arith(X87_ADD, a, b)); return CONT; }
         if ((!a.mantissa && isinf(n) && n > 0) || (e == 0x7fff && isinf(n) && n < 0)) { x87_put(s, 0, F80_INDEFINITE); return CONT; }   // 0 * 2^inf, inf * 2^-inf
@@ -1775,7 +1922,7 @@ static int x87(X64State *s, Dec *d, uint8_t op)
     // Arithmetic rounds as the control word says: switch the host's mode when it
     // differs from MXCSR's, which x64_run keeps it at.
     int rc = (s->fcw >> 10) & 3, sse_rc = (s->mxcsr >> 13) & 3;
-    if (rc != sse_rc) fesetround(host_rounding((uint32_t)rc << 13));
+    if (rc != sse_rc) host_set_rc(rc);
     int result = CONT;
     int reg = d->rmf;
     uint64_t ea = d->ea;
@@ -1919,7 +2066,7 @@ static int x87(X64State *s, Dec *d, uint8_t op)
             break;
         }
     }
-    if (rc != sse_rc) fesetround(host_rounding(s->mxcsr));
+    if (rc != sse_rc) host_set_rc(sse_rc);
     return result;
 }
 
@@ -2522,29 +2669,36 @@ opcode:
         uint64_t lo = size == 1 ? s->gpr[X64_RAX] & 0xff : s->gpr[X64_RAX] & m;
         uint64_t hi = size == 1 ? (s->gpr[X64_RAX] >> 8) & 0xff : s->gpr[X64_RDX] & m;
         uint64_t q, r;
-        if (d->regf == 6) {
-            unsigned __int128 n = ((unsigned __int128)hi << (size * 8)) | lo;
-            unsigned __int128 qq = n / src;
-            if (qq > m) return X64_EXIT_DIVIDE_ERROR;
-            q = (uint64_t)qq;
-            r = (uint64_t)(n % src);
-        } else {
-            __int128 n = (__int128)(((unsigned __int128)hi << (size * 8)) | lo);
-            int bits = size * 16;
-            if (bits < 128) n = (__int128)((unsigned __int128)n << (128 - bits)) >> (128 - bits);  // sign-extend
-            int64_t dv = sext(src, size);
-            __int128 qq;
-            if (dv == -1) {
-                // n / -1 overflows __int128 itself for its minimum, which only size 8 reaches.
-                if ((unsigned __int128)n == (unsigned __int128)1 << 127) return X64_EXIT_DIVIDE_ERROR;
-                qq = -n;
-                r = 0;
+        int bits = size * 8;
+        if (size < 8) {
+            // The dividend fits 64 bits.
+            if (d->regf == 6) {
+                uint64_t n = (hi << bits) | lo;
+                q = n / src;
+                r = n % src;
+                if (q > m) return X64_EXIT_DIVIDE_ERROR;
             } else {
-                qq = n / dv;
+                int64_t n = sext((hi << bits) | lo, size * 2), dv = sext(src, size);
+                if (dv == -1 && n == INT64_MIN) return X64_EXIT_DIVIDE_ERROR;
+                int64_t qq = n / dv;
+                if (qq > (int64_t)(sign_of(size) - 1) || qq < -(int64_t)sign_of(size)) return X64_EXIT_DIVIDE_ERROR;
+                q = (uint64_t)qq & m;
                 r = (uint64_t)(n % dv) & m;
             }
-            if (qq > (__int128)(int64_t)(sign_of(size) - 1) || qq < -(__int128)sign_of(size)) return X64_EXIT_DIVIDE_ERROR;
-            q = (uint64_t)qq & m;
+        } else if (d->regf == 6) {
+            if (hi >= src) return X64_EXIT_DIVIDE_ERROR;   // the quotient would not fit
+            q = udiv128(hi, lo, src, &r);
+        } else {
+            // On magnitudes; the remainder takes the dividend's sign.
+            bool neg_n = (hi >> 63) != 0, neg_d = (src >> 63) != 0;
+            uint64_t mhi = hi, mlo = lo, md = neg_d ? 0 - src : src;
+            if (neg_n) { mhi = ~hi + (lo == 0); mlo = 0 - lo; }
+            if (mhi >= md) return X64_EXIT_DIVIDE_ERROR;
+            uint64_t mq = udiv128(mhi, mlo, md, &r);
+            bool neg_q = neg_n != neg_d;
+            if (mq > (neg_q ? 0x8000000000000000ull : 0x7fffffffffffffffull)) return X64_EXIT_DIVIDE_ERROR;
+            q = neg_q ? 0 - mq : mq;
+            if (neg_n) r = 0 - r;
         }
         if (size == 1) set_reg(s, d, X64_RAX, 2, q | (r << 8));
         else { set_reg(s, d, X64_RAX, size, q); set_reg(s, d, X64_RDX, size, r); }
@@ -2810,9 +2964,10 @@ opcode:
             if (d->ea & 15) return X64_EXIT_ILLEGAL;   // #GP on x86
             unsigned __int128 expected = ((unsigned __int128)s->gpr[X64_RDX] << 64) | s->gpr[X64_RAX];
             unsigned __int128 desired = ((unsigned __int128)s->gpr[X64_RCX] << 64) | s->gpr[X64_RBX];
-            bool ok = __atomic_compare_exchange_n((unsigned __int128 *)(uintptr_t)d->ea, &expected, desired,
-                                                  false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-            if (!ok) { s->gpr[X64_RAX] = (uint64_t)expected; s->gpr[X64_RDX] = (uint64_t)(expected >> 64); }
+            // __sync rather than __atomic: GCC inlines only the former for 16 bytes.
+            unsigned __int128 old = __sync_val_compare_and_swap((unsigned __int128 *)(uintptr_t)d->ea, expected, desired);
+            bool ok = old == expected;
+            if (!ok) { s->gpr[X64_RAX] = (uint64_t)old; s->gpr[X64_RDX] = (uint64_t)(old >> 64); }
             set_flags(s, FL_ZF, ok ? FL_ZF : 0);
         } else {
             uint64_t expected = (s->gpr[X64_RDX] << 32) | (s->gpr[X64_RAX] & 0xffffffffull);
@@ -2877,8 +3032,8 @@ void x64_fxrstor(X64State *s, const void *area)
 
 X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *info)
 {
-    int saved_rounding = fegetround();
-    fesetround(host_rounding(s->mxcsr));
+    int saved_rounding = host_get_rc();
+    host_set_rc((int)((s->mxcsr >> 13) & 3));
     Dec d;
     int r;
     for (;;) {
@@ -2907,7 +3062,7 @@ X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *in
         }
         break;
     }
-    fesetround(saved_rounding);
+    host_set_rc(saved_rounding);
     return (X64Exit)r;
 }
 

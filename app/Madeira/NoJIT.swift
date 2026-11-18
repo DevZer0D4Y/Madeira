@@ -100,7 +100,7 @@ struct NoJITEngineSection: View {
         } header: {
             Text("No JIT engine")
         } footer: {
-            Text("Madeira's x86-64 interpreter runs Windows code without executable memory, so it needs no debugger, StikDebug or LocalDevVPN. The engine check runs small x86-64 programs through it and compares every answer with a real x86-64 CPU's. Games can't start this way yet: Wine's own libraries still need JIT, and interpreted code is much slower than JIT.")
+            Text("Madeira's x86 interpreter runs Windows code, 64-bit and 32-bit with x87 and MMX, without executable memory, so it needs no debugger, StikDebug or LocalDevVPN. The engine check runs small x86 programs through it and compares every answer with a real x86 CPU's. Games can't start this way yet: Wine's own libraries still need JIT, and interpreted code is much slower than JIT.")
         }
     }
 }

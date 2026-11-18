@@ -1,0 +1,4 @@
+LIBRARY wow64.dll
+EXPORTS
+    Wow64PassExceptionToGuest
+    Wow64SystemServiceEx

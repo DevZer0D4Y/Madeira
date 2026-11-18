@@ -1,0 +1,21 @@
+LIBRARY ntdll.dll
+EXPORTS
+    DbgPrint
+    LdrDisableThreadCalloutsForDll
+    LdrGetDllHandle
+    NtAllocateVirtualMemory
+    NtQueryInformationProcess
+    NtQueryPerformanceCounter
+    RtlFindExportedRoutineByName
+    RtlInitUnicodeString
+    RtlWow64GetThreadContext
+    RtlWow64SetThreadContext
+    atan2
+    cos
+    log
+    memcpy
+    memmove
+    memset
+    pow
+    sin
+    tan

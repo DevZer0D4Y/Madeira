@@ -17,6 +17,9 @@ On x86-64 Linux, also:
     32-bit process, recorded, and replayed through the interpreter's 32-bit mode.
 With qemu-aarch64 and an aarch64-linux-gnu toolchain, also:
   - the engine check, and replays of the recorded native fuzz results, on ARM64.
+With mingw-w64 GCC, or clang with lld and llvm-dlltool:
+  - the WoW64 CPU module (build/wow64-interp) builds, imports nothing but ntdll and
+    wow64, and exports every BTCpu entry point wow64.dll looks up.
 """
 from pathlib import Path
 import os
@@ -163,5 +166,24 @@ with tempfile.TemporaryDirectory(prefix='x64-interp-') as folder:
                 print('NOTE: no qemu-aarch64 and aarch64-linux-gnu-gcc: the ARM64 replay was not run')
     else:
         print('NOTE: not x86-64 Linux: the native comparisons were not run')
+
+    # The WoW64 CPU module: what it imports and exports.
+    objdump = shutil.which('llvm-objdump') or shutil.which('x86_64-w64-mingw32-objdump')
+    if objdump and (shutil.which('x86_64-w64-mingw32-gcc') or (shutil.which('clang') and shutil.which('ld.lld'))):
+        built = run('bash', root / 'build/wow64-interp/build.sh', folder / 'wow64interp', timeout=600)
+        dlls = [Path(line) for line in built.stdout.splitlines() if line.endswith('.dll')]
+        check(built.returncode == 0 and dlls, 'the WoW64 CPU module builds: ' + ', '.join(d.parent.name for d in dlls),
+              built.stderr[-3000:])
+        required = ['BTCpuGetBopCode', 'BTCpuGetContext', 'BTCpuIsProcessorFeaturePresent', 'BTCpuProcessInit',
+                    'BTCpuResetToConsistentState', 'BTCpuSetContext', 'BTCpuSimulate', '__wine_get_unix_opcode']
+        for dll in dlls:
+            dump = run(objdump, '-p', dll).stdout
+            imports = sorted(set(re.findall(r'DLL Name: (\S+)', dump)))
+            missing = [name for name in required if not re.search(r'\b' + re.escape(name) + r'\b', dump)]
+            check(imports == ['ntdll.dll', 'wow64.dll'] and not missing,
+                  f'{dll.parent.name} module imports {", ".join(imports)} only and exports the BTCpu entry points',
+                  f'imports {imports}, missing exports {missing}')
+    else:
+        print('NOTE: no mingw-w64 GCC or clang with lld: the WoW64 CPU module was not built')
 
 sys.exit(1 if failures else 0)
