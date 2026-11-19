@@ -48,6 +48,8 @@ for arch in arm64ec aarch64; do
 done
 bash "$R/build/fex-arm64ec/build.sh"
 bash "$R/build/fex-wow64/build.sh"
+# Madeira's x86 interpreter as a WoW64 CPU module, beside FEX's (madeira.cfg wow-cpu = interpreter).
+bash "$R/build/wow64-interp/build.sh" --install
 bash "$R/build/faultrep/build.sh"
 "$TC/arm64ec-w64-mingw32-clang" -shared -O2 \
     -Wl,--no-insert-timestamp \

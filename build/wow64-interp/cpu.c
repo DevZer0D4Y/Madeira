@@ -30,6 +30,7 @@
 // the 64-bit side dereferences (system call and unix call arguments, the
 // addresses in an exception record, which wow64.dll converts) is a host one.
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -56,6 +57,22 @@
 #ifndef STATUS_STACK_BUFFER_OVERRUN
 #define STATUS_STACK_BUFFER_OVERRUN ((NTSTATUS)0xC0000409)
 #endif
+
+// The 64-bit TEB. On ARM64 it is x18, read with one plain MOV: Madeira's loader
+// rewrites x18 reads on iOS, where x18 is not the TEB, and only some instruction
+// forms (loads and stores based on it, MOV, ADD, SUB). NtCurrentTeb() is a
+// compiler intrinsic in llvm-mingw's headers, and the compiler then uses x18 in
+// any instruction it likes (a CMP, a shift, a store of the pointer).
+static inline TEB *current_teb(void)
+{
+#ifdef __aarch64__
+    TEB *teb;
+    __asm__ volatile("mov %0, x18" : "=r"(teb));
+    return teb;
+#else
+    return NtCurrentTeb();
+#endif
+}
 
 // The CPU area wow64 gives each thread: flags, machine, then the 32-bit context.
 #pragma pack(push, 2)
@@ -87,7 +104,8 @@ NTSTATUS WINAPI LdrGetDllHandle(LPCWSTR path, ULONG flags, const UNICODE_STRING 
 void *WINAPI RtlFindExportedRoutineByName(HMODULE module, const char *name);
 NTSTATUS WINAPI LdrDisableThreadCalloutsForDll(HMODULE module);
 NTSTATUS WINAPI NtAllocateVirtualMemory(HANDLE process, PVOID *address, ULONG_PTR zero_bits, SIZE_T *size, ULONG type, ULONG protect);
-ULONG __cdecl DbgPrint(const char *format, ...);
+int __cdecl _vsnprintf(char *buffer, size_t size, const char *format, va_list args);
+int __cdecl __wine_dbg_output(const char *text);   // Wine's own: straight to the log, whatever WINEDEBUG says
 
 #define CURRENT_PROCESS ((HANDLE)~(ULONG_PTR)0)   // GetCurrentProcess() is kernel32's
 #define CURRENT_THREAD ((HANDLE)~(ULONG_PTR)1)
@@ -113,7 +131,7 @@ static struct thread_slot slots[MAX_THREADS];
 
 static struct thread_slot *thread_slot(BOOL create)
 {
-    void *teb = NtCurrentTeb();
+    void *teb = current_teb();
     size_t start = ((uintptr_t)teb >> 12) % MAX_THREADS;
     for (size_t i = 0; i < MAX_THREADS; i++) {
         struct thread_slot *slot = &slots[(start + i) % MAX_THREADS];
@@ -142,7 +160,19 @@ static void *thread_cache(struct thread_slot *slot)
 
 static CPU_AREA *cpu_area(void)
 {
-    return (CPU_AREA *)NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+    return (CPU_AREA *)current_teb()->TlsSlots[WOW64_TLS_CPURESERVED];
+}
+
+// A line in the log (Wine's debug output, which Madeira's log shows whatever WINEDEBUG says).
+static void say(const char *format, ...)
+{
+    char text[256];
+    va_list args;
+    va_start(args, format);
+    _vsnprintf(text, sizeof text - 1, format, args);
+    va_end(args);
+    text[sizeof text - 1] = 0;
+    __wine_dbg_output(text);
 }
 
 static inline void *host(uint32_t guest) { return (void *)(uintptr_t)(guest_base + guest); }
@@ -153,8 +183,9 @@ static inline uint64_t read64(uint32_t guest) { uint64_t v; memcpy(&v, host(gues
 static uint32_t teb32(void)
 {
     LONG offset;
-    memcpy(&offset, (const char *)NtCurrentTeb() + 0x180c, sizeof offset);   // TEB.WowTebOffset
-    return (uint32_t)((uintptr_t)NtCurrentTeb() + offset - guest_base);
+    const char *teb = (const char *)current_teb();
+    memcpy(&offset, teb + 0x180c, sizeof offset);   // TEB.WowTebOffset
+    return (uint32_t)((uintptr_t)teb + offset - guest_base);
 }
 
 static void load_state(X64State *s, const WOW64_CONTEXT *c)
@@ -384,8 +415,17 @@ void WINAPI BTCpuSimulate(void)
             raise_guest(&s, cpu, STATUS_PRIVILEGED_INSTRUCTION, eip, eip, 0, 0, 0);
             continue;
         case X64_EXIT_UNSUPPORTED:
-            DbgPrint("wow64interp: unsupported instruction at %08x: %02x %02x %02x %02x %02x %02x\n", eip, info.bytes[0],
-                     info.bytes[1], info.bytes[2], info.bytes[3], info.bytes[4], info.bytes[5]);
+            {
+                char bytes[3 * sizeof info.bytes + 1] = "";
+                static const char hex[] = "0123456789abcdef";
+                for (int i = 0; i < info.length && i < (int)sizeof info.bytes; i++) {
+                    bytes[3 * i] = ' ';
+                    bytes[3 * i + 1] = hex[info.bytes[i] >> 4];
+                    bytes[3 * i + 2] = hex[info.bytes[i] & 15];
+                    bytes[3 * i + 3] = 0;
+                }
+                say("wow64interp: unsupported instruction at %08x:%s (the bytes decoded; docs/NO-JIT.md)\n", eip, bytes);
+            }
             raise_guest(&s, cpu, STATUS_ILLEGAL_INSTRUCTION, eip, eip, 0, 0, 0);
             continue;
         case X64_EXIT_ILLEGAL: case X64_EXIT_SYSCALL:
@@ -448,15 +488,16 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
     if (status) return status;
     // Madeira's ntdll puts a below-2-GB allocation of a WoW64 process in its guest window.
     if (guest_base && ((uintptr_t)page < guest_base || (uintptr_t)page - guest_base >= 0x100000000ull)) {
-        DbgPrint("wow64interp: the dispatch page %p is outside the guest window at %p\n", page, (void *)guest_base);
+        say("wow64interp: the dispatch page %p is outside the guest window at %p\n", page, (void *)guest_base);
         return STATUS_NO_MEMORY;
     }
     memset(page, 0xcc, 0x1000);
     bop_syscall = (uint32_t)((uintptr_t)page - guest_base);
     bop_unix = bop_syscall + 16;
 
-    WOW64INFO_ *wow64info = NtCurrentTeb()->TlsSlots[WOW64_TLS_WOW64INFO];
+    WOW64INFO_ *wow64info = current_teb()->TlsSlots[WOW64_TLS_WOW64INFO];
     if (wow64info) wow64info->CpuFlags |= WOW64_CPUFLAGS_SOFTWARE;
+    say("wow64interp: this 32-bit process runs on Madeira's x86 interpreter (guest window at %p)\n", (void *)guest_base);
     return STATUS_SUCCESS;
 }
 

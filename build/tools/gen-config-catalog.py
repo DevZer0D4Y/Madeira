@@ -592,6 +592,13 @@ OVERLAY = {
     "cpu-count": {"title": "Reported CPU count (0 = device)"},
     "desktop-size": {"title": "Virtual desktop size (WxH)",
                      "note": "The developer interface's Wine desktop size (ml1127); its Resolution menu writes it (ml1157). Madeira Dock sessions without a game's Resolution use it too. Unset: this screen's shape at 1280x720's pixel count (ml1172: 1408x648 on a 19.5:9 iPhone, 1152x800 on an 11-inch iPad). Applies at the next app start."},
+    "wow-cpu": {"title": "32-bit programs run on", "kind": "choice", "category": "x86 emulation (FEX)",
+                "choices": [("", "FEX (default)"), ("interpreter", "Madeira's x86 interpreter (testing)")],
+                "note": "Unset or \"fex\": FEX translates 32-bit programs. \"interpreter\": they run on Madeira's x86 "
+                        "interpreter (wow64interp.dll, docs/NO-JIT.md), the engine the No JIT work is built on. JIT is "
+                        "still needed for now, and it is much slower than FEX: this is for trying older 32-bit games "
+                        "with it. The log says \"wow-cpu = interpreter\" when the session uses it, and names any "
+                        "instruction it does not support (wow64interp: unsupported instruction)."},
     "d3d9": {"title": "Direct3D 9 frontend", "kind": "choice",
              "choices": [("", "Default (emulated)"), ("native", "Native ARM64 frontend"),
                          ("wined3d", "Wine wined3d on OpenGL (Zink)")],

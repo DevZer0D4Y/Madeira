@@ -314,7 +314,11 @@ none are committed with the code.
 3. **FEX WOW64 module:** `build/fex-wow64/build.sh` configures `FEX/build-wow64`
    for `aarch64-w64-mingw32` with the iOS host options, builds target
    `wow64fex` and installs `Bin/libwow64fex.dll` as
-   `app/Madeira/aarch64-windows/xtajit.dll`.
+   `app/Madeira/aarch64-windows/xtajit.dll`. Beside it,
+   `build/wow64-interp/build.sh --install` builds Madeira's x86 interpreter as
+   a CPU module, `app/Madeira/aarch64-windows/wow64interp.dll`, which a session
+   uses instead of FEX with `wow-cpu = interpreter` in `madeira.cfg`
+   (docs/NO-JIT.md).
 4. **Smoke test:** `tests/x86/build.sh hello-x86` builds a kernel32-only
    i386 PE into `app/Madeira/i386-windows/`. Put `env.MADEIRA_EXE = hello-x86.exe`
    in `madeira.cfg` and launch: the log shows

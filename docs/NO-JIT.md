@@ -47,13 +47,20 @@ Steps, in order:
    (Testing, below). Madeira's own Wine does not build for Linux (its ntdll
    uses Apple's APIs), so this was upstream Wine 11.4, the release Madeira's
    is based on.
-3. **Run it in Madeira with JIT on**, in place of `xtajit.dll`: set
-   `HKLM\Software\Microsoft\Wow64\x86` to `wow64interp.dll` (wow64.dll reads
-   the module's name there). The ARM64 build reads the TEB through x18 like
-   Madeira's other ARM64 modules and needs the same handling. The module
-   follows the rules of Madeira's guest window as FEX's module does (guest
-   addresses for what 32-bit code sees, host addresses for what the 64-bit side
-   dereferences); that part could not run on Linux, where B is 0.
+3. **Run it in Madeira with JIT on** (ready to try): put `wow-cpu = interpreter`
+   in `Documents/madeira.cfg`, or in a game's own lines, or choose it in
+   Settings › Memory & sync › All settings, under x86 emulation (FEX):
+   "32-bit programs run on: Madeira's x86 interpreter (testing)". The
+   32-bit programs of that session then run on the interpreter instead of FEX,
+   with JIT on as before (the native modules still need it). It is much slower
+   than FEX: try older, lighter 32-bit games. The log shows
+   `[WineProc] wow-cpu = interpreter: ...` when the session uses it, then
+   `wow64interp: this 32-bit process runs on Madeira's x86 interpreter` for each
+   32-bit process, and `wow64interp: unsupported instruction at ...` with the
+   instruction's bytes if a program uses one the interpreter does not have.
+   What needs the device: Madeira's guest window (B is not 0 there, and the
+   module follows its rules as FEX's module does, but on Linux B is 0) and
+   the speed of the iPhone's cores.
 4. **The four native modules as signed code**: convert them to Mach-O when
    Madeira is built, so the sideloader signs them with the app and iOS loads
    them like any other library. The open upstream pull request #497 does this
@@ -188,7 +195,9 @@ than JIT, so No JIT suits older, lighter games.
 
 `build/wow64-interp/cpu.c` is a CPU module for Wine's `wow64.dll` that runs
 32-bit code with the interpreter (`build.sh` builds `wow64interp.dll` for
-x86-64 with mingw-w64 GCC and for ARM64 with clang and lld). It imports only
+x86-64 with mingw-w64 GCC, and for ARM64 with llvm-mingw, or clang and lld;
+`build.sh --install` puts the ARM64 one in `app/Madeira/aarch64-windows/`,
+which `build/windows-runtime/build.sh` runs beside FEX's module). It imports only
 `ntdll` and `wow64`, as a module on the 64-bit side of a WoW64 process must,
 and exports the `BTCpu` entry points `wow64.dll` looks up, as Wine's
 `wow64cpu.dll` and FEX's `xtajit.dll` do.
@@ -212,6 +221,15 @@ and exports the `BTCpu` entry points `wow64.dll` looks up, as Wine's
   `NtQueryInformationProcess(ProcessWineIosWowGuestBase)`, as for Madeira's
   other WoW64 code; on upstream Wine the query fails and B is 0.
 
+- In Madeira, `wow-cpu = interpreter` makes the session's `system32\xtajit.dll`
+  (and `sysaa64\xtajit.dll`) link to the farm's `wow64interp.dll`
+  (`app/Madeira/WineProcessBridge.m`), which is the file `wow64.dll` loads; the
+  loader keeps the module in its JIT-pool copy only, as it does FEX's.
+- On ARM64 it reads the TEB (x18) with one `MOV`: Madeira's loader rewrites x18
+  reads on iOS, where x18 is not the TEB, in a few instruction forms only, and
+  `check-x64-interpreter.py` fails if the module has any other.
+- Its messages go to Wine's debug output (`__wine_dbg_output`), which Madeira's
+  log shows whatever `WINEDEBUG` says.
 - On an x86-64 host, Wine keeps a 32-bit thread's x87, MMX and SSE registers
   in the processor rather than the CPU area (that is where `wow64cpu.dll`
   leaves them), so the module puts the program's there while 64-bit code runs

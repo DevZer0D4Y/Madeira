@@ -183,6 +183,18 @@ with tempfile.TemporaryDirectory(prefix='x64-interp-') as folder:
             check(imports == ['ntdll.dll', 'wow64.dll'] and not missing,
                   f'{dll.parent.name} module imports {", ".join(imports)} only and exports the BTCpu entry points',
                   f'imports {imports}, missing exports {missing}')
+            if dll.parent.name == 'aarch64':
+                # On iOS x18 is not the TEB: Madeira's loader rewrites the instructions that read it
+                # (ios_jit_patch_x18), in these forms only (the rule build/dxvk/build.sh checks).
+                uses = [' '.join(line.split()) for line in run(objdump, '-d', dll).stdout.splitlines()
+                        if re.search(r'\bx18\b', line)]
+                odd = [u for u in uses if not (
+                    re.search(r'\b(ldr|ldrb|ldrh|ldrsw|ldrsb|ldrsh|ldur|ldurb|ldurh|str|strb|strh|stur|sturb|sturh|ldp|stp)\b[^[]*\[x18', u)
+                    or re.search(r'\b(ldr|ldrb|ldrh|str|strb|strh)\b.*\[x[0-9]+, x18', u)
+                    or re.search(r'\b(mov|add|sub)\b\s+x[0-9]+, x18\b', u)
+                    or re.search(r'\badd\b\s+x[0-9]+, x[0-9]+, x18\b', u))]
+                check(uses and not odd, f'aarch64 module reads x18 (the TEB) only in forms the loader rewrites: {len(uses)} uses',
+                      '\n'.join(odd[:20]))
     else:
         print('NOTE: no mingw-w64 GCC or clang with lld: the WoW64 CPU module was not built')
 

@@ -1,6 +1,5 @@
 LIBRARY ntdll.dll
 EXPORTS
-    DbgPrint
     LdrDisableThreadCalloutsForDll
     LdrGetDllHandle
     NtAllocateVirtualMemory
@@ -12,6 +11,8 @@ EXPORTS
     RtlInitUnicodeString
     RtlWow64GetThreadContext
     RtlWow64SetThreadContext
+    _vsnprintf
+    __wine_dbg_output
     atan2
     cos
     log

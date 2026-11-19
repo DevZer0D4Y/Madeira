@@ -941,6 +941,48 @@ static BOOL madeira_d3d9_wined3d_wanted(void)
     return e && !strcasecmp(e, "wined3d");
 }
 
+/* wow-cpu = interpreter (madeira.cfg, or the game's own lines): the 32-bit
+ * programs of this session run on Madeira's x86 interpreter (docs/NO-JIT.md)
+ * instead of FEX. The aarch64 farm ships it as wow64interp.dll, a WoW64 CPU
+ * module beside FEX's xtajit.dll; the links that name the farm's xtajit.dll
+ * (system32 in an ARM64 session, and through the cross-link pass in an x64 one;
+ * sysaa64) are re-pointed at it, which is the file wow64.dll loads. JIT is still
+ * needed: the native ARM64 modules run from the JIT pool as before. This tests
+ * the interpreter with real programs on the device; it is slower than FEX.
+ * Unset or "fex": FEX. Every session relinks the farms first, so the next
+ * session without the setting gets FEX again. */
+static BOOL madeira_wow_cpu_interpreter_wanted(void)
+{
+    char v[32] = "";
+
+    return madeira_cfg_get("wow-cpu", v, sizeof v) && !strcasecmp(v, "interpreter");
+}
+
+static void madeira_link_wow_cpu_interpreter(NSFileManager *fm, NSString *prefix, NSString *bundle)
+{
+    NSString *win = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
+    NSString *farm = [bundle stringByAppendingPathComponent:@"aarch64-windows"];
+    NSString *src = [farm stringByAppendingPathComponent:@"wow64interp.dll"];
+    NSString *fex = [farm stringByAppendingPathComponent:@"xtajit.dll"];
+    NSString *dirs[2] = { @"system32", @"sysaa64" };
+    int linked[2] = { -1, -1 };
+
+    if (access(src.fileSystemRepresentation, R_OK) != 0) {
+        dprintf(STDERR_FILENO, "[WineProc] wow-cpu = interpreter: the bundle has no aarch64-windows/wow64interp.dll; "
+                "32-bit programs keep FEX\n");
+        return;
+    }
+    for (int i = 0; i < 2; i++) {
+        NSString *dst = [[win stringByAppendingPathComponent:dirs[i]] stringByAppendingPathComponent:@"xtajit.dll"];
+        if (![[fm destinationOfSymbolicLinkAtPath:dst error:nil] isEqualToString:fex]) continue;
+        [fm removeItemAtPath:dst error:nil];
+        linked[i] = [fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil] ? 1 : 0;
+    }
+    dprintf(STDERR_FILENO, "[WineProc] wow-cpu = interpreter: 32-bit programs run on Madeira's x86 interpreter, "
+            "not FEX (system32 %d, sysaa64 %d; 1 = linked, 0 = link failed, -1 = no FEX link there)\n",
+            linked[0], linked[1]);
+}
+
 /* <dir>\d3d9.dll -> <farm>/d3d9-wined3d.dll. 1 linked, 0 link failed, -1 the farm has no such file. */
 static int madeira_link_d3d9_wined3d_in(NSFileManager *fm, NSString *dir, NSString *farm)
 {
@@ -2329,6 +2371,8 @@ static void *wine_process_thread(void *arg) {
             madeira_link_wine_gecko(fm, prefix);
             if (madeira_d3d9_wined3d_wanted())
                 madeira_link_d3d9_wined3d(fm, prefix, bundlePath, has_i386_set);
+            if (has_i386_set && madeira_wow_cpu_interpreter_wanted())
+                madeira_link_wow_cpu_interpreter(fm, prefix, bundlePath);
             madeira_setup_vulkan(fm, prefix, bundlePath, use_arm64ec);
 
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
