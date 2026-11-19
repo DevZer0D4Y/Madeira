@@ -88,6 +88,16 @@ static void setup_input(uint64_t flags)
 static const char *const reg_names[16] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                                            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
 
+// Every other run goes through the decoded-instruction cache, which keeps its
+// entries from run to run: the same snippet again hits them, the next snippet at
+// the same address replaces them. The rest run without it (step() alone).
+static _Alignas(64) uint8_t fuzz_cache[X64_CACHE_SIZE];
+static void *next_cache(void)
+{
+    static unsigned runs;
+    return (runs++ & 1) ? NULL : fuzz_cache;
+}
+
 static void dump_input(void)
 {
     for (int i = 0; i < 16; i++)
@@ -122,7 +132,7 @@ static void interpret_and_compare(size_t pre, size_t len, uint64_t undef, uint64
     s.fs_base = fs_base;
     s.gs_base = gs_base;
     s.rip = CODE + pre;
-    X64Env env = { .stop_rip = CODE + pre + len };
+    X64Env env = { .stop_rip = CODE + pre + len, .cache = next_cache() };
     X64ExitInfo info;
     X64Exit exit = X64_EXIT_BUDGET;
     fault_signal = 0;
@@ -325,7 +335,7 @@ static int replay32(FILE *f)
             x64_fxrstor(&s, IN32->fx);
             s.seg_cs = sel[0]; s.seg_ds = sel[1]; s.seg_es = sel[2]; s.seg_ss = sel[3]; s.seg_fs = sel[4]; s.seg_gs = sel[5];
             s.rip = CODE + pre;
-            X64Env env = { .stop_rip = CODE + pre + code_len };
+            X64Env env = { .stop_rip = CODE + pre + code_len, .cache = next_cache() };
             X64ExitInfo info;
             X64Exit exit = run_guarded(&s, &env, &info);
             runs++;

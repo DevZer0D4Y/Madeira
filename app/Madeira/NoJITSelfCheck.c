@@ -60,14 +60,16 @@ bool madeira_nojit_self_check(MadeiraNoJITReport *report, char *text_buffer, siz
     if (text_buffer && text_size) text_buffer[0] = 0;
     size_t count = sizeof nojit_selfcheck_cases / sizeof nojit_selfcheck_cases[0];
     size_t code_size = (sizeof nojit_selfcheck_blob64 + 4095) & ~(size_t)4095;
-    void *code = NULL, *scratch = NULL, *stack = NULL, *window = NULL;
+    void *code = NULL, *scratch = NULL, *stack = NULL, *window = NULL, *cache = NULL;
     report->total = (int)count;
     if (posix_memalign(&code, 4096, code_size) || posix_memalign(&scratch, 4096, SCRATCH_SIZE) ||
-        posix_memalign(&stack, 4096, STACK_SIZE) || posix_memalign(&window, 4096, WINDOW_SIZE)) {
+        posix_memalign(&stack, 4096, STACK_SIZE) || posix_memalign(&window, 4096, WINDOW_SIZE) ||
+        posix_memalign(&cache, 64, X64_CACHE_SIZE)) {
         append(&out, "Could not allocate memory for the check.");
-        free(code); free(scratch); free(stack); free(window);
+        free(code); free(scratch); free(stack); free(window); free(cache);
         return false;
     }
+    memset(cache, 0, X64_CACHE_SIZE);
     // Plain heap memory: readable and writable, never executable. The interpreter
     // only reads the code as data.
     memcpy(code, nojit_selfcheck_blob64, sizeof nojit_selfcheck_blob64);
@@ -79,61 +81,75 @@ bool madeira_nojit_self_check(MadeiraNoJITReport *report, char *text_buffer, siz
     for (size_t i = 0; i < count; i++) {
         const struct NoJITCase *c = &nojit_selfcheck_cases[i];
         bool m32 = c->bits == 32;
+        // Twice: with the decoded-instruction cache, as games run, and without it.
         X64State s;
-        uint64_t stop = STOP_ADDRESS;
-        if (m32) {
-            // cdecl: the stop address as the return address, then seed (two halves), buffer, callback.
-            memset(w + GUEST_SCRATCH, 0, SCRATCH_SIZE);
-            x64_state_init32(&s, (uint64_t)(uintptr_t)w);
-            uint32_t esp = GUEST_STACK_TOP - 32;
-            uint32_t frame[5] = { STOP_ADDRESS, (uint32_t)c->seed, (uint32_t)(c->seed >> 32), GUEST_SCRATCH, CALLBACK_ADDRESS };
-            memcpy(w + esp, frame, sizeof frame);
-            s.gpr[X64_RSP] = esp;
-            s.rip = GUEST_CODE + c->entry;
-        } else {
-            memset(scratch, 0, SCRATCH_SIZE);
-            x64_state_init(&s);
-            // Windows x64 entry: 32 bytes of home space above the return address, which
-            // is the stop address, and RSP 8 below a 16-byte boundary.
-            uint64_t rsp = (((uint64_t)(uintptr_t)stack + STACK_SIZE) & ~(uint64_t)15) - 64;
-            rsp -= 8;
-            memcpy((void *)(uintptr_t)rsp, &stop, 8);
-            s.gpr[X64_RSP] = rsp;
-            s.gpr[X64_RCX] = c->seed;
-            s.gpr[X64_RDX] = (uint64_t)(uintptr_t)scratch;
-            s.gpr[X64_R8] = CALLBACK_ADDRESS;
-            s.rip = (uint64_t)(uintptr_t)code + c->entry;
-        }
-        X64Env env = { .stop_rip = STOP_ADDRESS, .is_native = is_callback, .user = NULL };
         X64ExitInfo info;
-        X64Exit exit;
-        uint64_t callbacks = 0;
-        double start = now();
-        for (;;) {
-            exit = x64_run(&s, &env, BUDGET, &info);
-            if (exit != X64_EXIT_NATIVE || s.rip != CALLBACK_ADDRESS) break;
-            callbacks++;
-            uint64_t a, b;
-            if (m32) {   // cdecl (uint64, uint64) above the return address
-                const uint8_t *args = w + (uint32_t)s.gpr[X64_RSP] + 4;
-                a = read64(args);
-                b = read64(args + 8);
+        X64Exit exit = X64_EXIT_STOP;
+        uint64_t result = 0, instructions = 0;
+        double seconds = 0, uncached = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            uint64_t stop = STOP_ADDRESS;
+            if (m32) {
+                // cdecl: the stop address as the return address, then seed (two halves), buffer, callback.
+                memset(w + GUEST_SCRATCH, 0, SCRATCH_SIZE);
+                x64_state_init32(&s, (uint64_t)(uintptr_t)w);
+                uint32_t esp = GUEST_STACK_TOP - 32;
+                uint32_t frame[5] = { STOP_ADDRESS, (uint32_t)c->seed, (uint32_t)(c->seed >> 32), GUEST_SCRATCH, CALLBACK_ADDRESS };
+                memcpy(w + esp, frame, sizeof frame);
+                s.gpr[X64_RSP] = esp;
+                s.rip = GUEST_CODE + c->entry;
             } else {
-                a = s.gpr[X64_RCX];
-                b = s.gpr[X64_RDX];
+                memset(scratch, 0, SCRATCH_SIZE);
+                x64_state_init(&s);
+                // Windows x64 entry: 32 bytes of home space above the return address, which
+                // is the stop address, and RSP 8 below a 16-byte boundary.
+                uint64_t rsp = (((uint64_t)(uintptr_t)stack + STACK_SIZE) & ~(uint64_t)15) - 64;
+                rsp -= 8;
+                memcpy((void *)(uintptr_t)rsp, &stop, 8);
+                s.gpr[X64_RSP] = rsp;
+                s.gpr[X64_RCX] = c->seed;
+                s.gpr[X64_RDX] = (uint64_t)(uintptr_t)scratch;
+                s.gpr[X64_R8] = CALLBACK_ADDRESS;
+                s.rip = (uint64_t)(uintptr_t)code + c->entry;
             }
-            x64_return_from_native(&s, madeira_nojit_callback(a, b));
+            X64Env env = { .stop_rip = STOP_ADDRESS, .is_native = is_callback, .user = NULL, .cache = pass == 0 ? cache : NULL };
+            uint64_t callbacks = 0;
+            double start = now();
+            for (;;) {
+                exit = x64_run(&s, &env, BUDGET, &info);
+                if (exit != X64_EXIT_NATIVE || s.rip != CALLBACK_ADDRESS) break;
+                callbacks++;
+                uint64_t a, b;
+                if (m32) {   // cdecl (uint64, uint64) above the return address
+                    const uint8_t *args = w + (uint32_t)s.gpr[X64_RSP] + 4;
+                    a = read64(args);
+                    b = read64(args + 8);
+                } else {
+                    a = s.gpr[X64_RCX];
+                    b = s.gpr[X64_RDX];
+                }
+                x64_return_from_native(&s, madeira_nojit_callback(a, b));
+            }
+            double elapsed = now() - start;
+            result = m32 ? (s.gpr[X64_RDX] << 32) | (uint32_t)s.gpr[X64_RAX] : s.gpr[X64_RAX];
+            if (pass == 0) {
+                seconds = elapsed;
+                instructions = s.instructions;
+                report->seconds += elapsed;
+                report->instructions += s.instructions;
+                report->callbacks += callbacks;
+            } else {
+                uncached = elapsed;
+                report->uncached_seconds += elapsed;
+            }
+            if (exit != X64_EXIT_STOP || result != c->expect) break;   // report the first that differs
         }
-        double seconds = now() - start;
-        report->seconds += seconds;
-        report->instructions += s.instructions;
-        report->callbacks += callbacks;
-        uint64_t result = m32 ? (s.gpr[X64_RDX] << 32) | (uint32_t)s.gpr[X64_RAX] : s.gpr[X64_RAX];
 
         if (exit == X64_EXIT_STOP && result == c->expect) {
             report->passed++;
-            snprintf(line, sizeof line, "ok   %d-bit %-9s seed %llx: %llu instructions in %.0f ms", c->bits, c->name,
-                     (unsigned long long)c->seed, (unsigned long long)s.instructions, seconds * 1000);
+            snprintf(line, sizeof line, "ok   %d-bit %-9s seed %llx: %llu instructions in %.0f ms (%.0f ms without the cache)",
+                     c->bits, c->name, (unsigned long long)c->seed, (unsigned long long)instructions, seconds * 1000,
+                     uncached * 1000);
         } else if (exit == X64_EXIT_STOP) {
             snprintf(line, sizeof line, "FAIL %d-bit %-9s seed %llx: got %016llx, expected %016llx", c->bits, c->name,
                      (unsigned long long)c->seed, (unsigned long long)result, (unsigned long long)c->expect);
@@ -146,11 +162,12 @@ bool madeira_nojit_self_check(MadeiraNoJITReport *report, char *text_buffer, siz
         }
         append(&out, line);
     }
-    snprintf(line, sizeof line, "%d of %d checks matched a real x86 CPU (64- and 32-bit): %llu instructions, %llu host calls, "
-             "%.1f million instructions a second.", report->passed, report->total,
-             (unsigned long long)report->instructions, (unsigned long long)report->callbacks,
-             report->seconds > 0 ? (double)report->instructions / report->seconds / 1e6 : 0.0);
+    snprintf(line, sizeof line, "%d of %d checks matched a real x86 CPU (64- and 32-bit), with the instruction cache and "
+             "without: %llu instructions, %llu host calls, %.1f million instructions a second (%.1f without the cache).",
+             report->passed, report->total, (unsigned long long)report->instructions, (unsigned long long)report->callbacks,
+             report->seconds > 0 ? (double)report->instructions / report->seconds / 1e6 : 0.0,
+             report->uncached_seconds > 0 ? (double)report->instructions / report->uncached_seconds / 1e6 : 0.0);
     append(&out, line);
-    free(code); free(scratch); free(stack); free(window);
+    free(code); free(scratch); free(stack); free(window); free(cache);
     return report->passed == report->total;
 }

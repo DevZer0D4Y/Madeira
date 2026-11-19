@@ -9,5 +9,6 @@ EXPORTS
     BTCpuSetContext
     BTCpuSimulate
     BTCpuThreadInit
+    BTCpuThreadTerm
     BTCpuTurboThunkControl
     __wine_get_unix_opcode

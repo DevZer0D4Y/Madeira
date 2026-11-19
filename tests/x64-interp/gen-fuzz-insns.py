@@ -46,6 +46,27 @@ for op in ['add', 'or', 'adc', 'sbb', 'and', 'sub', 'xor', 'cmp']:
                      'word ptr [rsi+0x22], 0x7fff']:
             t(f'lock {op} {form}', u)
 
+# Flag producers followed by flag consumers: the interpreter works flags out
+# lazily, so each condition is read after each kind of producer.
+for producer, u in [('cmp eax, ebx', 0), ('sub rcx, rdx', 0), ('add esi, edi', 0), ('cmp al, bl', 0), ('cmp r8w, r9w', 0),
+                    ('and eax, ebx', AF), ('test rcx, rdx', AF), ('xor sil, dil', AF), ('or ax, bx', AF), ('inc eax', 0),
+                    ('dec cl', 0), ('neg ebx', 0), ('cmp eax, dword ptr [rsi+8]', 0), ('sbb ecx, edx', 0),
+                    ('adc rax, rbx', 0), ('sbb dl, 0x80', 0)]:
+    for cc in ['o', 'no', 'b', 'ae', 'e', 'ne', 'be', 'a', 's', 'ns', 'p', 'np', 'l', 'ge', 'le', 'g']:
+        t(f'{producer}; set{cc} r10b', u)
+    t(f'{producer}; cmovle r11, r12; cmovb r13, r14; cmovo r15, rbx', u)
+    t(f'{producer}; adc r10d, r11d', u)
+    t(f'{producer}; jl 1f; mov r10d, 1; 1: jbe 2f; mov r11d, 2; 2: nop', u)
+    t(f'{producer}; inc r12; setc r13b; sets r14b', u)
+    t(f'{producer}; pushfq; pop r10', u)
+    t(f'{producer}; shl r10d, 3', u | AF | OF)
+    t(f'{producer}; shr r11, cl', u | AF | OF, RCX_SMALL)
+    t(f'{producer}; rcl r12w, 1', u)
+# Self-modifying code: each pass changes the immediate the next one runs (restored at the end).
+t('lea rdx, [rip + 2f]; mov ecx, 3; 2: mov eax, 0x11111111; add ebx, eax; inc byte ptr [rdx+1]; dec ecx; jnz 2b; sub byte ptr [rdx+1], 3')
+t('lea rdx, [rip + 2f]; mov byte ptr [rdx], 0x90; 2: int3; mov byte ptr [rdx], 0xcc')   # written before it first runs
+t('mov ecx, 5; 1: add eax, ecx; dec ecx; jnz 1b')
+t('xor eax, eax; 1: add eax, 3; cmp eax, 30; jl 1b; sete bl')
 for op in ['inc', 'dec', 'neg', 'not']:
     for form in ['rax', 'ebx', 'cx', 'dl', 'ah', 'r12', 'r9b', 'qword ptr [rsi+8]', 'byte ptr [rdi]', 'word ptr [rsi+2]']:
         t(f'{op} {form}')

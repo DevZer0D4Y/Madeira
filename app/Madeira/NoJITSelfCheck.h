@@ -22,7 +22,8 @@ typedef struct MadeiraNoJITReport {
     int passed;
     int total;
     uint64_t instructions;      // guest instructions interpreted
-    double seconds;             // time spent interpreting
+    double seconds;             // time spent interpreting, with the decoded-instruction cache
+    double uncached_seconds;    // the same programs without it
     uint64_t callbacks;         // calls the guest made into host (native) code
 } MadeiraNoJITReport;
 

@@ -56,9 +56,7 @@ typedef struct X64State {
     uint16_t seg_cs, seg_ds, seg_es, seg_fs, seg_gs, seg_ss;
     uint64_t instructions;      // instructions retired, for statistics
     // x87 registers by physical number: ST(i) is st[(TOP + i) & 7]. The MMX
-    // registers are their significands. Arithmetic is done in double precision,
-    // which is what Windows' default control word (0x27F, 53-bit) asks for;
-    // loads, stores and moves keep all 80 bits.
+    // registers are their significands.
     X87Reg st[8];
     uint8_t ftw;                // abridged tag word: bit i set while st[i] holds a value
     // 32-bit (WoW64) code: 32-bit registers, addresses and stack. Guest address a
@@ -66,6 +64,11 @@ typedef struct X64State {
     bool mode32;
     uint64_t guest_base;
     uint64_t insn_start;        // the instruction being executed, for fault reporting
+    // Arithmetic flags not yet folded into rflags: the last ADD, SUB, CMP, logic
+    // operation, INC or DEC leaves its operands here, and the flags are worked out
+    // when something reads them. x64_run folds them in before it returns.
+    uint64_t lazy_a, lazy_b, lazy_r;
+    uint8_t lazy_op, lazy_size, lazy_carry;
 } X64State;
 
 typedef enum X64Exit {
@@ -89,7 +92,16 @@ typedef struct X64Env {
     // Whether a CALL or JMP target is native (host) code. NULL: none is.
     bool (*is_native)(void *user, uint64_t target);
     void *user;
+    // Optional: X64_CACHE_SIZE bytes of zeroed memory, aligned to 64, that one
+    // thread at a time runs with (NULL: none). x64_run keeps the instructions it
+    // decodes there, and runs the common ones from it. Each time it runs a cached
+    // instruction it checks that the instruction's bytes are still the same, so
+    // code that changes (self-modifying code, a game's own JIT) is decoded again.
+    void *cache;
 } X64Env;
+
+#define X64_CACHE_ENTRIES 8192u
+#define X64_CACHE_SIZE (X64_CACHE_ENTRIES * 64u)
 
 typedef struct X64ExitInfo {
     uint64_t rip;           // address of the instruction that stopped the run
@@ -111,6 +123,11 @@ void x64_state_init32(X64State *state, uint64_t guest_base);
 /// once. The host's rounding mode follows MXCSR while it runs and is restored
 /// before it returns. `info` may be NULL.
 X64Exit x64_run(X64State *state, const X64Env *env, uint64_t budget, X64ExitInfo *info);
+
+/// Folds pending arithmetic flags into state->rflags. For a host that reads the
+/// state while x64_run is still running it (a fault handler); after x64_run
+/// returns, rflags is already complete.
+void x64_flush_flags(X64State *state);
 
 /// Finishes a call that left with X64_EXIT_NATIVE: RAX takes the native
 /// function's result and the return address is popped into rip. In 32-bit mode

@@ -11,7 +11,7 @@
 int main(void)
 {
     MadeiraNoJITReport report;
-    char text[4096];
+    char text[16384];
     bool ok = madeira_nojit_self_check(&report, text, sizeof text);
     fputs(text, stdout);
     return ok ? 0 : 1;

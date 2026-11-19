@@ -158,7 +158,10 @@ static inline int osz(const Dec *d) { return (d->rex & 8) ? 8 : d->opsize ? 2 : 
 // ---------------------------------------------------------------------------
 // Registers and memory
 
-static inline uint64_t mask_of(int size) { return size == 8 ? ~0ull : (1ull << (size * 8)) - 1; }
+// By operand size (1, 2, 4 or 8 bytes).
+static const uint64_t size_masks[16] = { [1] = 0xff, [2] = 0xffff, [4] = 0xffffffffull, [8] = ~0ull };
+static const uint64_t size_signs[16] = { [1] = 0x80, [2] = 0x8000, [4] = 0x80000000ull, [8] = 0x8000000000000000ull };
+static inline uint64_t mask_of(int size) { return size_masks[size & 15]; }
 
 // Guest address to host address, and the width of addresses and of EIP.
 static inline uint64_t ha(const X64State *s, uint64_t guest)
@@ -168,7 +171,7 @@ static inline uint64_t ha(const X64State *s, uint64_t guest)
 static inline uint64_t ipm(const X64State *s, uint64_t v) { return s->mode32 ? (uint32_t)v : v; }
 // PUSH and POP's operand size: 64 bits (32 in 32-bit mode), 16 with 66.
 static inline int stack_size(const X64State *s, const Dec *d) { return d->opsize ? 2 : s->mode32 ? 4 : 8; }
-static inline uint64_t sign_of(int size) { return 1ull << (size * 8 - 1); }
+static inline uint64_t sign_of(int size) { return size_signs[size & 15]; }
 
 static inline int64_t sext(uint64_t v, int size)
 {
@@ -412,6 +415,80 @@ static uint64_t udiv128(uint64_t hi, uint64_t lo, uint64_t d, uint64_t *remainde
     }
     *remainder = hi;
     return q;
+}
+
+// A whole register of 16, 32 or 64 bits (rAX, rDX: no byte registers).
+static inline void put_reg(X64State *s, int reg, int size, uint64_t v)
+{
+    if (size == 2) s->gpr[reg] = (s->gpr[reg] & ~0xffffull) | (v & 0xffff);
+    else if (size == 4) s->gpr[reg] = v & 0xffffffffull;
+    else s->gpr[reg] = v;
+}
+
+// MUL, IMUL, DIV and IDIV (group 3, regf 4 to 7) of rAX (and rDX) by src: CONT or
+// X64_EXIT_DIVIDE_ERROR, which changes nothing. DIV and IDIV leave the flags.
+static int muldiv(X64State *s, int regf, uint64_t src, int size)
+{
+    uint64_t m = mask_of(size);
+    if (regf == 4 || regf == 5) { // MUL, IMUL
+        uint64_t lo, hi;
+        bool over;
+        if (regf == 4) {
+            unsigned __int128 p = (unsigned __int128)(s->gpr[X64_RAX] & m) * src;
+            lo = (uint64_t)p & m;
+            hi = size == 8 ? (uint64_t)(p >> 64) : (uint64_t)(p >> (size * 8)) & m;
+            over = hi != 0;
+        } else {
+            __int128 p = (__int128)sext(s->gpr[X64_RAX], size) * sext(src, size);
+            lo = (uint64_t)p & m;
+            hi = size == 8 ? (uint64_t)((unsigned __int128)p >> 64) : (uint64_t)(p >> (size * 8)) & m;
+            over = (__int128)sext(lo, size) != p;
+        }
+        if (size == 1) put_reg(s, X64_RAX, 2, lo | (hi << 8));
+        else { put_reg(s, X64_RAX, size, lo); put_reg(s, X64_RDX, size, hi); }
+        s->lazy_op = 0;   // every arithmetic flag is set here
+        set_flags(s, FL_ARITH, (over ? FL_CF | FL_OF : 0) | szp(lo, size));
+        return CONT;
+    }
+    // DIV, IDIV
+    if ((src & m) == 0) return X64_EXIT_DIVIDE_ERROR;
+    uint64_t lo = size == 1 ? s->gpr[X64_RAX] & 0xff : s->gpr[X64_RAX] & m;
+    uint64_t hi = size == 1 ? (s->gpr[X64_RAX] >> 8) & 0xff : s->gpr[X64_RDX] & m;
+    uint64_t q, r;
+    int bits = size * 8;
+    if (size < 8) {
+        // The dividend fits 64 bits.
+        if (regf == 6) {
+            uint64_t n = (hi << bits) | lo;
+            q = n / src;
+            r = n % src;
+            if (q > m) return X64_EXIT_DIVIDE_ERROR;
+        } else {
+            int64_t n = sext((hi << bits) | lo, size * 2), dv = sext(src, size);
+            if (dv == -1 && n == INT64_MIN) return X64_EXIT_DIVIDE_ERROR;
+            int64_t qq = n / dv;
+            if (qq > (int64_t)(sign_of(size) - 1) || qq < -(int64_t)sign_of(size)) return X64_EXIT_DIVIDE_ERROR;
+            q = (uint64_t)qq & m;
+            r = (uint64_t)(n % dv) & m;
+        }
+    } else if (regf == 6) {
+        if (hi >= src) return X64_EXIT_DIVIDE_ERROR;   // the quotient would not fit
+        q = udiv128(hi, lo, src, &r);
+    } else {
+        // On magnitudes; the remainder takes the dividend's sign.
+        bool neg_n = (hi >> 63) != 0, neg_d = (src >> 63) != 0;
+        uint64_t mhi = hi, mlo = lo, md = neg_d ? 0 - src : src;
+        if (neg_n) { mhi = ~hi + (lo == 0); mlo = 0 - lo; }
+        if (mhi >= md) return X64_EXIT_DIVIDE_ERROR;
+        uint64_t mq = udiv128(mhi, mlo, md, &r);
+        bool neg_q = neg_n != neg_d;
+        if (mq > (neg_q ? 0x8000000000000000ull : 0x7fffffffffffffffull)) return X64_EXIT_DIVIDE_ERROR;
+        q = neg_q ? 0 - mq : mq;
+        if (neg_n) r = 0 - r;
+    }
+    if (size == 1) put_reg(s, X64_RAX, 2, q | (r << 8));
+    else { put_reg(s, X64_RAX, size, q); put_reg(s, X64_RDX, size, r); }
+    return CONT;
 }
 
 // Read-modify-write operations, which LOCK makes atomic.
@@ -2882,65 +2959,7 @@ opcode:
         case 2: rmw(s, d, size, RMW_NOT, 0, 0); return CONT;
         case 3: rmw(s, d, size, RMW_NEG, 0, 0); return CONT;
         }
-        uint64_t src = get_rm(s, d, size), m = mask_of(size);
-        if (d->regf == 4 || d->regf == 5) { // MUL, IMUL
-            uint64_t lo, hi;
-            bool over;
-            if (d->regf == 4) {
-                unsigned __int128 p = (unsigned __int128)(s->gpr[X64_RAX] & m) * src;
-                lo = (uint64_t)p & m;
-                hi = size == 8 ? (uint64_t)(p >> 64) : (uint64_t)(p >> (size * 8)) & m;
-                over = hi != 0;
-            } else {
-                __int128 p = (__int128)sext(s->gpr[X64_RAX], size) * sext(src, size);
-                lo = (uint64_t)p & m;
-                hi = size == 8 ? (uint64_t)((unsigned __int128)p >> 64) : (uint64_t)(p >> (size * 8)) & m;
-                over = (__int128)sext(lo, size) != p;
-            }
-            if (size == 1) set_reg(s, d, X64_RAX, 2, lo | (hi << 8));
-            else { set_reg(s, d, X64_RAX, size, lo); set_reg(s, d, X64_RDX, size, hi); }
-            set_flags(s, FL_ARITH, (over ? FL_CF | FL_OF : 0) | szp(lo, size));
-            return CONT;
-        }
-        // DIV, IDIV
-        if ((src & m) == 0) return X64_EXIT_DIVIDE_ERROR;
-        uint64_t lo = size == 1 ? s->gpr[X64_RAX] & 0xff : s->gpr[X64_RAX] & m;
-        uint64_t hi = size == 1 ? (s->gpr[X64_RAX] >> 8) & 0xff : s->gpr[X64_RDX] & m;
-        uint64_t q, r;
-        int bits = size * 8;
-        if (size < 8) {
-            // The dividend fits 64 bits.
-            if (d->regf == 6) {
-                uint64_t n = (hi << bits) | lo;
-                q = n / src;
-                r = n % src;
-                if (q > m) return X64_EXIT_DIVIDE_ERROR;
-            } else {
-                int64_t n = sext((hi << bits) | lo, size * 2), dv = sext(src, size);
-                if (dv == -1 && n == INT64_MIN) return X64_EXIT_DIVIDE_ERROR;
-                int64_t qq = n / dv;
-                if (qq > (int64_t)(sign_of(size) - 1) || qq < -(int64_t)sign_of(size)) return X64_EXIT_DIVIDE_ERROR;
-                q = (uint64_t)qq & m;
-                r = (uint64_t)(n % dv) & m;
-            }
-        } else if (d->regf == 6) {
-            if (hi >= src) return X64_EXIT_DIVIDE_ERROR;   // the quotient would not fit
-            q = udiv128(hi, lo, src, &r);
-        } else {
-            // On magnitudes; the remainder takes the dividend's sign.
-            bool neg_n = (hi >> 63) != 0, neg_d = (src >> 63) != 0;
-            uint64_t mhi = hi, mlo = lo, md = neg_d ? 0 - src : src;
-            if (neg_n) { mhi = ~hi + (lo == 0); mlo = 0 - lo; }
-            if (mhi >= md) return X64_EXIT_DIVIDE_ERROR;
-            uint64_t mq = udiv128(mhi, mlo, md, &r);
-            bool neg_q = neg_n != neg_d;
-            if (mq > (neg_q ? 0x8000000000000000ull : 0x7fffffffffffffffull)) return X64_EXIT_DIVIDE_ERROR;
-            q = neg_q ? 0 - mq : mq;
-            if (neg_n) r = 0 - r;
-        }
-        if (size == 1) set_reg(s, d, X64_RAX, 2, q | (r << 8));
-        else { set_reg(s, d, X64_RAX, size, q); set_reg(s, d, X64_RDX, size, r); }
-        return CONT;
+        return muldiv(s, d->regf, get_rm(s, d, size), size);
     }
     case 0xFE: case 0xFF: { // group 4, group 5
         modrm(d);
@@ -3268,12 +3287,580 @@ void x64_fxrstor(X64State *s, const void *area)
     fx_load(s, (const uint8_t *)area);
 }
 
+// ---------------------------------------------------------------------------
+// Lazy flags
+//
+// ADD, SUB, CMP, AND, OR, XOR, TEST, INC and DEC run from the cache leave their
+// operands in the state instead of working out six flags each time; most are
+// overwritten before anything reads them. flags_flush works them out, and
+// lazy_cond answers a condition after a CMP or TEST without it.
+
+enum { LF_NONE, LF_ADD, LF_SUB, LF_LOGIC, LF_INC, LF_DEC, LF_ADC, LF_SBB };
+
+static inline void lazy(X64State *s, int op, int size, uint64_t a, uint64_t b, uint64_t r)
+{
+    s->lazy_op = (uint8_t)op;
+    s->lazy_size = (uint8_t)size;
+    s->lazy_a = a;
+    s->lazy_b = b;
+    s->lazy_r = r;
+}
+
+static void flags_flush(X64State *s)
+{
+    uint64_t a = s->lazy_a, b = s->lazy_b, r = s->lazy_r, sign = sign_of(s->lazy_size), f, which = FL_ARITH;
+    switch (s->lazy_op) {
+    case LF_NONE: return;
+    case LF_ADD: case LF_INC:
+        f = (r < a ? FL_CF : 0) | (((a ^ r) & (b ^ r) & sign) ? FL_OF : 0) | (((a ^ b ^ r) & 0x10) ? FL_AF : 0);
+        break;
+    case LF_SUB: case LF_DEC:
+        f = (a < b ? FL_CF : 0) | (((a ^ b) & (a ^ r) & sign) ? FL_OF : 0) | (((a ^ b ^ r) & 0x10) ? FL_AF : 0);
+        break;
+    case LF_ADC:   // with lazy_carry in
+        f = (r < a || (s->lazy_carry && r == a) ? FL_CF : 0) | (((a ^ r) & (b ^ r) & sign) ? FL_OF : 0)
+          | (((a ^ b ^ r) & 0x10) ? FL_AF : 0);
+        break;
+    case LF_SBB:
+        f = (a < b || (s->lazy_carry && a == b) ? FL_CF : 0) | (((a ^ b) & (a ^ r) & sign) ? FL_OF : 0)
+          | (((a ^ b ^ r) & 0x10) ? FL_AF : 0);
+        break;
+    default:   // LF_LOGIC: CF, OF and AF clear
+        f = 0;
+        break;
+    }
+    f |= szp(r, s->lazy_size);
+    if (s->lazy_op == LF_INC || s->lazy_op == LF_DEC) which &= ~FL_CF;   // CF stays
+    s->rflags = (s->rflags & ~which) | (f & which);
+    s->lazy_op = LF_NONE;
+}
+
+void x64_flush_flags(X64State *s)
+{
+    flags_flush(s);
+}
+
+// CF alone, for INC and DEC, which keep it.
+static inline uint64_t lazy_cf(const X64State *s)
+{
+    switch (s->lazy_op) {
+    case LF_ADD: return s->lazy_r < s->lazy_a ? FL_CF : 0;
+    case LF_SUB: return s->lazy_a < s->lazy_b ? FL_CF : 0;
+    case LF_ADC: return s->lazy_r < s->lazy_a || (s->lazy_carry && s->lazy_r == s->lazy_a) ? FL_CF : 0;
+    case LF_SBB: return s->lazy_a < s->lazy_b || (s->lazy_carry && s->lazy_a == s->lazy_b) ? FL_CF : 0;
+    case LF_LOGIC: return 0;
+    default: return s->rflags & FL_CF;
+    }
+}
+
+static inline bool lazy_cond(X64State *s, int cc)
+{
+    uint64_t a = s->lazy_a, b = s->lazy_b, r = s->lazy_r, sign = sign_of(s->lazy_size);
+    bool v;
+    if (s->lazy_op == LF_SUB && (cc >> 1) != 5) {
+        int size = s->lazy_size;
+        switch (cc >> 1) {
+        case 0: v = ((a ^ b) & (a ^ r) & sign) != 0; break;   // O
+        case 1: v = a < b; break;                             // B
+        case 2: v = r == 0; break;                            // Z
+        case 3: v = a <= b; break;                            // BE
+        case 4: v = (r & sign) != 0; break;                   // S
+        case 6: v = sext(a, size) < sext(b, size); break;     // L
+        default: v = sext(a, size) <= sext(b, size); break;   // LE
+        }
+        return (cc & 1) ? !v : v;
+    }
+    if (s->lazy_op == LF_LOGIC && (cc >> 1) != 5) {
+        switch (cc >> 1) {
+        case 0: case 1: v = false; break;                     // O B
+        case 2: case 3: v = r == 0; break;                    // Z BE
+        case 4: case 6: v = (r & sign) != 0; break;           // S L
+        default: v = r == 0 || (r & sign) != 0; break;        // LE
+        }
+        return (cc & 1) ? !v : v;
+    }
+    flags_flush(s);
+    return cond(s, cc);
+}
+
+// ---------------------------------------------------------------------------
+// The decoded-instruction cache (X64Env.cache)
+//
+// One 64-byte entry per instruction, direct-mapped by address. An entry for one
+// of the common forms below holds it decoded; any other instruction's entry says
+// so, and step() decodes and runs it as before. Before an entry runs, the
+// instruction's bytes are compared with the ones it was decoded from.
+
+enum {
+    FX_EMPTY, FX_SLOW,
+    FX_ALU_RM_R, FX_ALU_R_RM, FX_ALU_RM_I,   // aux: the ALU operation
+    FX_TEST_RM_R, FX_TEST_RM_I,
+    FX_MOV_RM_R, FX_MOV_R_RM, FX_MOV_RM_I, FX_LEA,
+    FX_INC, FX_DEC,
+    FX_PUSH_R, FX_POP_R, FX_PUSH_I, FX_PUSH_RM,
+    FX_JCC, FX_JMP, FX_CALL, FX_RET,         // imm: the target (JCC JMP CALL), the bytes to release (RET)
+    FX_JMP_RM, FX_CALL_RM,
+    FX_MOVZX, FX_MOVSX,                      // aux: the source size
+    FX_SETCC, FX_CMOV,                       // aux: the condition
+    FX_IMUL_R_RM, FX_IMUL_R_RM_I,
+    FX_SHIFT,                                // aux: the operation; imm: the count, or 256 for CL
+    FX_SHIFTD,                               // SHLD (aux 1) SHRD (aux 0); imm as FX_SHIFT
+    FX_GROUP3,                               // aux: NOT NEG MUL IMUL DIV IDIV (2 to 7)
+    FX_NOP, FX_CWDE, FX_CDQ,
+};
+
+#define FX_NONE 0xff     // no base or index register
+#define FX_RIPREL 0xfe   // base: RIP
+
+typedef struct FastEntry {
+    uint64_t tag;          // guest address, bit 63 set for 32-bit mode
+    uint64_t w0, w1;       // the instruction's bytes, and which of them count
+    uint64_t m0, m1;
+    uint64_t imm;
+    int32_t disp;
+    uint8_t len, kind, size, aux;
+    uint8_t reg, rm;       // ModRM.reg; the register operand (when not memory)
+    uint8_t base, index, scale, seg, rex;
+    uint8_t mem;
+} FastEntry;
+
+_Static_assert(sizeof(FastEntry) <= 64, "a cache entry is 64 bytes");
+
+static inline uint64_t fx_tag(const X64State *s, uint64_t rip)
+{
+    return s->mode32 ? rip | 0x8000000000000000ull : rip;
+}
+
+static inline FastEntry *fx_entry(void *cache, uint64_t rip)
+{
+    return (FastEntry *)cache + ((rip ^ (rip >> 13)) & (X64_CACHE_ENTRIES - 1));
+}
+
+static inline uint64_t load64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+
+// Whether the bytes at p are still the entry's.
+static inline bool fx_same(const FastEntry *e, const uint8_t *p)
+{
+    if (((uintptr_t)p & 4095) <= 4096 - 16)   // both words on one page: no fault past its end
+        return !(((load64(p) ^ e->w0) & e->m0) | ((load64(p + 8) ^ e->w1) & e->m1));
+    uint8_t bytes[16];
+    memcpy(bytes, &e->w0, 8);
+    memcpy(bytes + 8, &e->w1, 8);
+    return !memcmp(bytes, p, e->len);
+}
+
+static inline uint32_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+static inline uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+
+// ModRM, SIB and displacement into the entry; returns what follows them.
+static const uint8_t *fx_modrm(FastEntry *e, const uint8_t *p, bool m32, uint8_t rex, int *regf)
+{
+    uint8_t m = *p++;
+    int mod = m >> 6, rmf = m & 7;
+    *regf = (m >> 3) & 7;
+    e->reg = (uint8_t)(*regf | ((rex & 4) << 1));
+    e->base = e->index = FX_NONE;
+    e->scale = 0;
+    e->disp = 0;
+    if (mod == 3) {
+        e->mem = 0;
+        e->rm = (uint8_t)(rmf | ((rex & 1) << 3));
+        return p;
+    }
+    e->mem = 1;
+    if (rmf == 4) {
+        uint8_t sib = *p++;
+        int index = ((sib >> 3) & 7) | ((rex & 2) << 2);
+        if (index != 4) { e->index = (uint8_t)index; e->scale = (uint8_t)(sib >> 6); }
+        if ((sib & 7) == 5 && mod == 0) { e->disp = (int32_t)rd32(p); p += 4; }
+        else e->base = (uint8_t)((sib & 7) | ((rex & 1) << 3));
+    } else if (rmf == 5 && mod == 0) {
+        if (!m32) e->base = FX_RIPREL;
+        e->disp = (int32_t)rd32(p);
+        p += 4;
+    } else {
+        e->base = (uint8_t)(rmf | ((rex & 1) << 3));
+    }
+    if (mod == 1) e->disp = (int8_t)*p++;
+    else if (mod == 2) { e->disp = (int32_t)rd32(p); p += 4; }
+    return p;
+}
+
+// An immediate of the operand size: 8 or 16 bits as they are, 32 sign-extended.
+static inline const uint8_t *fx_imm(FastEntry *e, const uint8_t *p, int size)
+{
+    if (size == 1) { e->imm = *p; return p + 1; }
+    if (size == 2) { e->imm = rd16(p); return p + 2; }
+    e->imm = (uint64_t)(int64_t)(int32_t)rd32(p);
+    return p + 4;
+}
+
+// Decodes the instruction at p (guest address rip) into e: one of the forms
+// below, or FX_SLOW. Either way the entry keeps the bytes the decision was made
+// from (for FX_SLOW, the ones read before it), and is decoded again when they
+// change.
+static void fx_decode(const X64State *s, FastEntry *e, uint64_t rip, const uint8_t *p0)
+{
+    const uint8_t *p = p0;
+    bool m32 = s->mode32, opsize = false;
+    uint8_t rex = 0, op;
+    int seg = 0, regf = 0, size = 4;
+    e->tag = fx_tag(s, rip);
+    e->kind = FX_SLOW;
+    e->mem = 0;
+    e->base = e->index = FX_NONE;
+    e->disp = 0;
+    e->imm = 0;
+    int kind = FX_SLOW;
+    for (;;) {
+        if (p - p0 >= 8) goto done;                                // a long run of prefixes: step()
+        op = *p;
+        if (!m32 && (op & 0xF0) == 0x40) { rex = op; p++; continue; }
+        if (op == 0x66) opsize = true;
+        else if (op == 0x64 || op == 0x65) seg = op == 0x64 ? 4 : 5;
+        else if (op != 0x26 && op != 0x2E && op != 0x36 && op != 0x3E) break;   // F0 F2 F3 67: step()
+        rex = 0;   // a REX prefix only counts right before the opcode
+        p++;
+    }
+    p++;
+    size = (rex & 8) ? 8 : opsize ? 2 : 4;
+    int stack = opsize ? 2 : m32 ? 4 : 8;
+    if (op < 0x40 && (op & 7) < 6 && op != 0x0F) {             // ALU
+        e->aux = (uint8_t)(op >> 3);
+        int form = op & 7;
+        if (!(form & 1)) size = 1;
+        if (form >= 4) { p = fx_imm(e, p, size); e->rm = X64_RAX; kind = FX_ALU_RM_I; }
+        else { p = fx_modrm(e, p, m32, rex, &regf); kind = form < 2 ? FX_ALU_RM_R : FX_ALU_R_RM; }
+    } else if (op >= 0x40 && op <= 0x4F) {                     // INC, DEC (32-bit mode)
+        e->rm = op & 7;
+        kind = op < 0x48 ? FX_INC : FX_DEC;
+    } else if (op >= 0x50 && op <= 0x57) { e->reg = (uint8_t)((op & 7) | ((rex & 1) << 3)); size = stack; kind = FX_PUSH_R; }
+    else if (op >= 0x58 && op <= 0x5F) { e->reg = (uint8_t)((op & 7) | ((rex & 1) << 3)); size = stack; kind = FX_POP_R; }
+    else if (op == 0x68 || op == 0x6A) {
+        size = stack;
+        if (op == 0x6A) e->imm = (uint64_t)(int64_t)(int8_t)*p++;
+        else p = fx_imm(e, p, size);
+        kind = FX_PUSH_I;
+    } else if (op == 0x69 || op == 0x6B) {
+        p = fx_modrm(e, p, m32, rex, &regf);
+        if (op == 0x6B) e->imm = (uint64_t)(int64_t)(int8_t)*p++;
+        else if (size == 2) { e->imm = (uint64_t)(int64_t)(int16_t)rd16(p); p += 2; }
+        else { e->imm = (uint64_t)(int64_t)(int32_t)rd32(p); p += 4; }
+        kind = FX_IMUL_R_RM_I;
+    } else if (op >= 0x70 && op <= 0x7F) {
+        int8_t rel = (int8_t)*p++;
+        e->aux = op & 15;
+        e->imm = (uint64_t)(int64_t)rel;
+        kind = opsize ? FX_SLOW : FX_JCC;
+    } else if (op == 0x80 || op == 0x81 || op == 0x83) {
+        if (op == 0x80) size = 1;
+        p = fx_modrm(e, p, m32, rex, &regf);
+        if (op == 0x83) e->imm = (uint64_t)(int64_t)(int8_t)*p++;
+        else p = fx_imm(e, p, size);
+        e->aux = (uint8_t)regf;
+        kind = FX_ALU_RM_I;
+    } else if (op == 0x84 || op == 0x85) {
+        if (op == 0x84) size = 1;
+        p = fx_modrm(e, p, m32, rex, &regf);
+        kind = FX_TEST_RM_R;
+    } else if (op >= 0x88 && op <= 0x8B) {
+        if (!(op & 1)) size = 1;
+        p = fx_modrm(e, p, m32, rex, &regf);
+        kind = op < 0x8A ? FX_MOV_RM_R : FX_MOV_R_RM;
+    } else if (op == 0x8D) {
+        p = fx_modrm(e, p, m32, rex, &regf);
+        if (e->mem) kind = FX_LEA;
+    } else if (op == 0x90) {
+        if (!(rex & 1)) kind = FX_NOP;                         // with REX.B: XCHG R8, RAX
+    } else if (op == 0x98) kind = FX_CWDE;
+    else if (op == 0x99) kind = FX_CDQ;
+    else if (op == 0xA8 || op == 0xA9) {
+        if (op == 0xA8) size = 1;
+        p = fx_imm(e, p, size);
+        e->rm = X64_RAX;
+        kind = FX_TEST_RM_I;
+    } else if (op >= 0xB0 && op <= 0xBF) {
+        e->rm = (uint8_t)((op & 7) | ((rex & 1) << 3));
+        if (op < 0xB8) { size = 1; e->imm = *p++; }
+        else if (size == 8) { e->imm = load64(p); p += 8; }
+        else if (size == 2) { e->imm = rd16(p); p += 2; }
+        else { e->imm = rd32(p); p += 4; }
+        kind = FX_MOV_RM_I;
+    } else if (op == 0xC0 || op == 0xC1 || op == 0xD0 || op == 0xD1 || op == 0xD2 || op == 0xD3) {
+        if (!(op & 1)) size = 1;
+        p = fx_modrm(e, p, m32, rex, &regf);
+        e->imm = op <= 0xC1 ? *p++ : op <= 0xD1 ? 1 : 256;
+        e->aux = (uint8_t)regf;
+        kind = FX_SHIFT;
+    } else if (op == 0xC2 || op == 0xC3) {
+        if (op == 0xC2) { e->imm = rd16(p); p += 2; }
+        kind = opsize ? FX_SLOW : FX_RET;
+    } else if (op == 0xC6 || op == 0xC7) {
+        if (op == 0xC6) size = 1;
+        p = fx_modrm(e, p, m32, rex, &regf);
+        if (regf == 0) { p = fx_imm(e, p, size); kind = FX_MOV_RM_I; }
+    } else if (op == 0xE8 || op == 0xE9 || op == 0xEB) {
+        int64_t rel;
+        if (op == 0xEB) rel = (int8_t)*p++;
+        else { rel = (int32_t)rd32(p); p += 4; }
+        e->imm = (uint64_t)rel;
+        kind = opsize ? FX_SLOW : op == 0xE8 ? FX_CALL : FX_JMP;
+    } else if (op == 0xF6 || op == 0xF7) {
+        if (op == 0xF6) size = 1;
+        p = fx_modrm(e, p, m32, rex, &regf);
+        if (regf < 2) { p = fx_imm(e, p, size); kind = FX_TEST_RM_I; }
+        else { e->aux = (uint8_t)regf; kind = FX_GROUP3; }
+    } else if (op == 0xFE || op == 0xFF) {
+        if (op == 0xFE) size = 1;
+        p = fx_modrm(e, p, m32, rex, &regf);
+        if (regf == 0) kind = FX_INC;
+        else if (regf == 1) kind = FX_DEC;
+        else if (op == 0xFF && regf == 2) kind = FX_CALL_RM;
+        else if (op == 0xFF && regf == 4) kind = FX_JMP_RM;
+        else if (op == 0xFF && regf == 6) { size = stack; kind = FX_PUSH_RM; }
+    } else if (op == 0x0F) {
+        op = *p++;
+        if (op == 0x0D || (op >= 0x18 && op <= 0x1F)) { p = fx_modrm(e, p, m32, rex, &regf); kind = FX_NOP; }   // hint NOPs
+        else if (op >= 0x40 && op <= 0x4F) { p = fx_modrm(e, p, m32, rex, &regf); e->aux = op & 15; kind = FX_CMOV; }
+        else if (op >= 0x80 && op <= 0x8F) {
+            e->imm = (uint64_t)(int64_t)(int32_t)rd32(p);
+            p += 4;
+            e->aux = op & 15;
+            kind = opsize ? FX_SLOW : FX_JCC;
+        } else if (op >= 0x90 && op <= 0x9F) { p = fx_modrm(e, p, m32, rex, &regf); e->aux = op & 15; size = 1; kind = FX_SETCC; }
+        else if (op == 0xAF) { p = fx_modrm(e, p, m32, rex, &regf); kind = FX_IMUL_R_RM; }
+        else if (op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) {
+            p = fx_modrm(e, p, m32, rex, &regf);
+            e->imm = (op & 1) ? 256 : *p++;
+            e->aux = op < 0xA8;
+            kind = FX_SHIFTD;
+        }
+        else if (op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF) {
+            p = fx_modrm(e, p, m32, rex, &regf);
+            e->aux = (op & 1) ? 2 : 1;
+            kind = op >= 0xBE ? FX_MOVSX : FX_MOVZX;
+        }
+    }
+done:;
+    size_t len = (size_t)(p - p0);
+    if (len > 15) { kind = FX_SLOW; len = 15; }   // step() reports it; 15 bytes decided that
+    if (kind == FX_JCC || kind == FX_JMP || kind == FX_CALL)   // the target, as EIP or RIP holds it
+        e->imm = ipm(s, rip + len + e->imm);
+    e->len = (uint8_t)len;
+    e->size = (uint8_t)size;
+    e->seg = (uint8_t)seg;
+    e->rex = rex != 0;
+    uint8_t bytes[16] = { 0 };
+    memcpy(bytes, p0, len);
+    memcpy(&e->w0, bytes, 8);
+    memcpy(&e->w1, bytes + 8, 8);
+    e->m0 = len >= 8 ? ~0ull : (1ull << (8 * len)) - 1;
+    e->m1 = len <= 8 ? 0 : (1ull << (8 * (len - 8))) - 1;
+    e->kind = (uint8_t)kind;
+}
+
+static inline uint64_t fx_getr(const X64State *s, const FastEntry *e, int reg, int size)
+{
+    if (size == 1) {
+        if (!e->rex && reg >= 4 && reg < 8) return (s->gpr[reg - 4] >> 8) & 0xff;
+        return s->gpr[reg] & 0xff;
+    }
+    return s->gpr[reg] & mask_of(size);
+}
+
+static inline void fx_setr(X64State *s, const FastEntry *e, int reg, int size, uint64_t v)
+{
+    switch (size) {
+    case 1:
+        if (!e->rex && reg >= 4 && reg < 8) s->gpr[reg - 4] = (s->gpr[reg - 4] & ~0xff00ull) | ((v & 0xff) << 8);
+        else s->gpr[reg] = (s->gpr[reg] & ~0xffull) | (v & 0xff);
+        break;
+    case 2: s->gpr[reg] = (s->gpr[reg] & ~0xffffull) | (v & 0xffff); break;
+    case 4: s->gpr[reg] = v & 0xffffffffull; break;
+    default: s->gpr[reg] = v; break;
+    }
+}
+
+// The memory operand's offset (LEA's result), and its host address.
+static inline uint64_t fx_offset(const X64State *s, const FastEntry *e, uint64_t next)
+{
+    uint64_t off = (uint64_t)(int64_t)e->disp;
+    if (e->base == FX_RIPREL) off += next;
+    else if (e->base != FX_NONE) off += s->gpr[e->base];
+    if (e->index != FX_NONE) off += s->gpr[e->index] << e->scale;
+    return s->mode32 ? (uint32_t)off : off;
+}
+
+static inline uint64_t fx_ea(const X64State *s, const FastEntry *e, uint64_t next)
+{
+    uint64_t a = fx_offset(s, e, next) + (e->seg == 4 ? s->fs_base : e->seg == 5 ? s->gs_base : 0);
+    return s->mode32 ? s->guest_base + (uint32_t)a : a;
+}
+
+static inline uint64_t fx_get(const X64State *s, const FastEntry *e, uint64_t ea, int size)
+{
+    return e->mem ? mem_read(ea, size) : fx_getr(s, e, e->rm, size);
+}
+
+static inline void fx_set(X64State *s, const FastEntry *e, uint64_t ea, int size, uint64_t v)
+{
+    if (e->mem) mem_write(ea, size, v);
+    else fx_setr(s, e, e->rm, size, v);
+}
+
+// An ALU operation, its flags left lazy (ADC and SBB work them out).
+static inline uint64_t fx_alu(X64State *s, int op, uint64_t a, uint64_t b, int size)
+{
+    uint64_t m = mask_of(size), r;
+    a &= m;
+    b &= m;
+    switch (op) {
+    case ALU_ADD: r = (a + b) & m; lazy(s, LF_ADD, size, a, b, r); return r;
+    case ALU_SUB: case ALU_CMP: r = (a - b) & m; lazy(s, LF_SUB, size, a, b, r); return r;
+    case ALU_AND: r = a & b; break;
+    case ALU_OR: r = a | b; break;
+    case ALU_XOR: r = a ^ b; break;
+    default: {   // ADC SBB: CF in
+        uint64_t c = lazy_cf(s) ? 1 : 0;
+        r = (op == ALU_ADC ? a + b + c : a - b - c) & m;
+        lazy(s, op == ALU_ADC ? LF_ADC : LF_SBB, size, a, b, r);
+        s->lazy_carry = (uint8_t)c;
+        return r;
+    }
+    }
+    lazy(s, LF_LOGIC, size, 0, 0, r);
+    return r;
+}
+
+static inline void fx_imul_flags(X64State *s, uint64_t r, __int128 full, int size)
+{
+    bool over = (__int128)sext(r, size) != full;
+    s->lazy_op = LF_NONE;   // every arithmetic flag is set here
+    set_flags(s, FL_ARITH, (over ? FL_CF | FL_OF : 0) | szp(r, size));
+}
+
+#define FX_FALLBACK (-2)   // run this one with step() instead; nothing has changed
+
+// Runs a decoded instruction: what step() does for it.
+static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
+{
+    uint64_t next = ipm(s, s->rip + e->len), ea = 0, v, t;
+    int size = e->size;
+    if (e->mem) ea = fx_ea(s, e, next);
+    switch (e->kind) {
+    case FX_ALU_RM_R:
+        if (e->aux == ALU_CMP) fx_alu(s, ALU_CMP, fx_get(s, e, ea, size), fx_getr(s, e, e->reg, size), size);
+        else fx_set(s, e, ea, size, fx_alu(s, e->aux, fx_get(s, e, ea, size), fx_getr(s, e, e->reg, size), size));
+        break;
+    case FX_ALU_R_RM:
+        v = fx_alu(s, e->aux, fx_getr(s, e, e->reg, size), fx_get(s, e, ea, size), size);
+        if (e->aux != ALU_CMP) fx_setr(s, e, e->reg, size, v);
+        break;
+    case FX_ALU_RM_I:
+        if (e->aux == ALU_CMP) fx_alu(s, ALU_CMP, fx_get(s, e, ea, size), e->imm, size);
+        else fx_set(s, e, ea, size, fx_alu(s, e->aux, fx_get(s, e, ea, size), e->imm, size));
+        break;
+    case FX_TEST_RM_R: fx_alu(s, ALU_AND, fx_get(s, e, ea, size), fx_getr(s, e, e->reg, size), size); break;
+    case FX_TEST_RM_I: fx_alu(s, ALU_AND, fx_get(s, e, ea, size), e->imm, size); break;
+    case FX_MOV_RM_R: fx_set(s, e, ea, size, fx_getr(s, e, e->reg, size)); break;
+    case FX_MOV_R_RM: fx_setr(s, e, e->reg, size, fx_get(s, e, ea, size)); break;
+    case FX_MOV_RM_I: fx_set(s, e, ea, size, e->imm); break;
+    case FX_LEA: fx_setr(s, e, e->reg, size, fx_offset(s, e, next)); break;
+    case FX_INC: case FX_DEC: {
+        uint64_t m = mask_of(size), a = fx_get(s, e, ea, size) & m;
+        uint64_t r = (e->kind == FX_INC ? a + 1 : a - 1) & m;
+        s->rflags = (s->rflags & ~FL_CF) | lazy_cf(s);
+        lazy(s, e->kind == FX_INC ? LF_INC : LF_DEC, size, a, 1, r);
+        fx_set(s, e, ea, size, r);
+        break;
+    }
+    case FX_PUSH_R: push(s, s->gpr[e->reg] & mask_of(size), size); break;
+    case FX_POP_R: v = pop(s, size); fx_setr(s, e, e->reg, size, v); break;
+    case FX_PUSH_I: push(s, e->imm & mask_of(size), size); break;
+    case FX_PUSH_RM: push(s, fx_get(s, e, ea, size), size); break;
+    case FX_JCC:
+        s->rip = (s->lazy_op ? lazy_cond(s, e->aux) : cond(s, e->aux)) ? e->imm : next;
+        return CONT;
+    case FX_JMP:
+        if (native(env, e->imm)) return FX_FALLBACK;
+        s->rip = e->imm;
+        return CONT;
+    case FX_CALL:
+        if (native(env, e->imm)) return FX_FALLBACK;
+        push(s, next, s->mode32 ? 4 : 8);
+        s->rip = e->imm;
+        return CONT;
+    case FX_JMP_RM: case FX_CALL_RM:
+        t = ipm(s, fx_get(s, e, ea, s->mode32 ? 4 : 8));
+        if (native(env, t)) return FX_FALLBACK;
+        if (e->kind == FX_CALL_RM) push(s, next, s->mode32 ? 4 : 8);
+        s->rip = t;
+        return CONT;
+    case FX_RET:
+        s->rip = pop(s, s->mode32 ? 4 : 8);
+        s->gpr[X64_RSP] = ipm(s, s->gpr[X64_RSP] + e->imm);
+        return CONT;
+    case FX_MOVZX: case FX_MOVSX:
+        v = fx_get(s, e, ea, e->aux);
+        fx_setr(s, e, e->reg, size, e->kind == FX_MOVSX ? (uint64_t)sext(v, e->aux) : v);
+        break;
+    case FX_SETCC: fx_set(s, e, ea, 1, s->lazy_op ? lazy_cond(s, e->aux) : cond(s, e->aux)); break;
+    case FX_CMOV:
+        v = fx_get(s, e, ea, size);
+        fx_setr(s, e, e->reg, size, (s->lazy_op ? lazy_cond(s, e->aux) : cond(s, e->aux)) ? v : fx_getr(s, e, e->reg, size));
+        break;
+    case FX_IMUL_R_RM: {
+        __int128 full = (__int128)sext(fx_getr(s, e, e->reg, size), size) * sext(fx_get(s, e, ea, size), size);
+        uint64_t r = (uint64_t)full & mask_of(size);
+        fx_imul_flags(s, r, full, size);
+        fx_setr(s, e, e->reg, size, r);
+        break;
+    }
+    case FX_IMUL_R_RM_I: {
+        __int128 full = (__int128)sext(fx_get(s, e, ea, size), size) * (int64_t)e->imm;
+        uint64_t r = (uint64_t)full & mask_of(size);
+        fx_imul_flags(s, r, full, size);
+        fx_setr(s, e, e->reg, size, r);
+        break;
+    }
+    case FX_SHIFT: {
+        unsigned count = e->imm == 256 ? (unsigned)(s->gpr[X64_RCX] & 0xff) : (unsigned)e->imm;
+        unsigned masked = count & (size == 8 ? 63 : 31);
+        flags_flush(s);
+        v = shift(s, e->aux, fx_get(s, e, ea, size), count, size);
+        if (masked || size == 4) fx_set(s, e, ea, size, v);
+        break;
+    }
+    case FX_SHIFTD: {
+        unsigned count = e->imm == 256 ? (unsigned)(s->gpr[X64_RCX] & 0xff) : (unsigned)e->imm;
+        unsigned masked = count & (size == 8 ? 63 : 31);
+        flags_flush(s);
+        v = double_shift(s, e->aux, fx_get(s, e, ea, size), fx_getr(s, e, e->reg, size), count, size);
+        if (masked || size == 4) fx_set(s, e, ea, size, v);
+        break;
+    }
+    case FX_GROUP3: {
+        uint64_t a = fx_get(s, e, ea, size);
+        if (e->aux == 2) fx_set(s, e, ea, size, ~a & mask_of(size));                 // NOT
+        else if (e->aux == 3) fx_set(s, e, ea, size, fx_alu(s, ALU_SUB, 0, a, size));  // NEG: CF is a != 0
+        else if (muldiv(s, e->aux, a, size) != CONT) return FX_FALLBACK;               // a divide error: step() raises it
+        break;
+    }
+    case FX_NOP: break;
+    case FX_CWDE: fx_setr(s, e, X64_RAX, size, (uint64_t)sext(s->gpr[X64_RAX], size / 2)); break;
+    case FX_CDQ: fx_setr(s, e, X64_RDX, size, (s->gpr[X64_RAX] & sign_of(size)) ? ~0ull : 0); break;
+    }
+    s->rip = next;
+    return CONT;
+}
+
 X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *info)
 {
     int saved_rounding = host_get_rc();
     host_set_rc((int)((s->mxcsr >> 13) & 3));
     Dec d;
     int r;
+    void *cache = env->cache;
     for (;;) {
         if (s->rip == env->stop_rip || budget == 0) {
             r = s->rip == env->stop_rip ? X64_EXIT_STOP : X64_EXIT_BUDGET;
@@ -3282,6 +3869,15 @@ X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *in
         }
         if (budget != UINT64_MAX) budget--;
         uint64_t start = s->rip;
+        if (cache) {
+            FastEntry *e = fx_entry(cache, start);
+            const uint8_t *code = (const uint8_t *)(uintptr_t)ha(s, start);
+            s->insn_start = start;
+            if (e->tag != fx_tag(s, start) || e->kind == FX_EMPTY || !fx_same(e, code))
+                fx_decode(s, e, start, code);   // new, or changed, code
+            if (e->kind != FX_SLOW && fx_run(s, env, e) == CONT) { s->instructions++; continue; }
+        }
+        flags_flush(s);   // step() reads and writes rflags itself
         r = step(s, env, &d);
         if (r == CONT) { s->instructions++; continue; }
         if (r == X64_EXIT_DIVIDE_ERROR || r == X64_EXIT_ILLEGAL || r == X64_EXIT_PRIVILEGED ||
@@ -3300,6 +3896,7 @@ X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *in
         }
         break;
     }
+    flags_flush(s);
     host_set_rc(saved_rounding);
     return (X64Exit)r;
 }
@@ -3380,6 +3977,7 @@ void x64_state_from_context(X64State *s, const void *context)
     memcpy(&s->rip, c + CTX_RIP, 8);
     memcpy(&flags32, c + CTX_EFLAGS, 4);
     s->rflags = flags32 | 2;
+    s->lazy_op = 0;
     memcpy(&s->mxcsr, c + CTX_MXCSR, 4);
     memcpy(&s->seg_cs, c + CTX_SEGCS, 2);
     memcpy(&s->seg_ds, c + CTX_SEGDS, 2);

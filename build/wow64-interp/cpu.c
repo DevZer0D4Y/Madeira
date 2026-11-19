@@ -89,7 +89,9 @@ NTSTATUS WINAPI LdrDisableThreadCalloutsForDll(HMODULE module);
 NTSTATUS WINAPI NtAllocateVirtualMemory(HANDLE process, PVOID *address, ULONG_PTR zero_bits, SIZE_T *size, ULONG type, ULONG protect);
 ULONG __cdecl DbgPrint(const char *format, ...);
 
-#define CURRENT_PROCESS ((HANDLE)~(ULONG_PTR)0)   // CURRENT_PROCESS is kernel32's
+#define CURRENT_PROCESS ((HANDLE)~(ULONG_PTR)0)   // GetCurrentProcess() is kernel32's
+#define CURRENT_THREAD ((HANDLE)~(ULONG_PTR)1)
+NTSTATUS WINAPI NtFreeVirtualMemory(HANDLE process, PVOID *address, SIZE_T *size, ULONG type);
 
 typedef NTSTATUS (WINAPI *unix_call_fn)(UINT64 handle, unsigned int code, void *args);
 
@@ -105,6 +107,7 @@ struct thread_slot {
     void *volatile teb;
     X64State *volatile state;
     volatile LONG running;
+    void *cache;               // the thread's decoded-instruction cache (X64Env.cache)
 };
 static struct thread_slot slots[MAX_THREADS];
 
@@ -122,6 +125,19 @@ static struct thread_slot *thread_slot(BOOL create)
         }
     }
     return NULL;
+}
+
+// The thread's decoded-instruction cache, allocated the first time (NULL if that fails:
+// the interpreter runs without one).
+static void *thread_cache(struct thread_slot *slot)
+{
+    if (!slot) return NULL;
+    if (!slot->cache) {
+        void *p = NULL;
+        SIZE_T size = X64_CACHE_SIZE;
+        if (!NtAllocateVirtualMemory(CURRENT_PROCESS, &p, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) slot->cache = p;
+    }
+    return slot->cache;
 }
 
 static CPU_AREA *cpu_area(void)
@@ -319,6 +335,7 @@ void WINAPI BTCpuSimulate(void)
     for (;;) {
         X64ExitInfo info;
         if (slot) { slot->state = &s; slot->running = 1; }   // a callback may have used the slot
+        env.cache = thread_cache(slot);                      // BTCpuThreadTerm may have freed it
         X64Exit exit = x64_run(&s, &env, UINT64_MAX, &info);
         if (slot) slot->running = 0;
         uint32_t eip = (uint32_t)info.rip, esp = (uint32_t)s.gpr[X64_RSP];
@@ -389,6 +406,7 @@ NTSTATUS WINAPI BTCpuResetToConsistentState(EXCEPTION_POINTERS *pointers)
     struct thread_slot *slot = thread_slot(FALSE);
     if (!slot || !slot->running || !slot->state) return STATUS_SUCCESS;
     X64State *s = slot->state;
+    x64_flush_flags(s);   // the arithmetic flags x64_run had not worked out yet
     s->rip = s->insn_start;
     store_state(&cpu_area()->Context, s);
     pointers->ExceptionRecord->ExceptionAddress = host((uint32_t)s->insn_start);
@@ -445,6 +463,26 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
 void WINAPI BTCpuThreadInit(void)
 {
     thread_slot(TRUE);
+}
+
+// NtTerminateThread: a thread ending itself frees its cache. (Its slot stays, for
+// the next thread with the same TEB address.)
+void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code)
+{
+    struct { NTSTATUS status; void *teb; CLIENT_ID id; ULONG_PTR affinity; LONG priority, base; } info, self;
+    (void)code;
+    if (thread && thread != CURRENT_THREAD) {
+        if (NtQueryInformationThread(thread, ThreadBasicInformation, &info, sizeof info, NULL) ||
+            NtQueryInformationThread(CURRENT_THREAD, ThreadBasicInformation, &self, sizeof self, NULL) ||
+            info.id.UniqueThread != self.id.UniqueThread)
+            return;
+    }
+    struct thread_slot *slot = thread_slot(FALSE);
+    if (!slot || !slot->cache) return;
+    void *p = slot->cache;
+    SIZE_T size = 0;
+    slot->cache = NULL;
+    NtFreeVirtualMemory(CURRENT_PROCESS, &p, &size, MEM_RELEASE);
 }
 
 // Guest addresses: wow64.dll stores them where the 32-bit side reads them.

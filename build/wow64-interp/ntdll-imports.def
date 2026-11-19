@@ -4,7 +4,9 @@ EXPORTS
     LdrDisableThreadCalloutsForDll
     LdrGetDllHandle
     NtAllocateVirtualMemory
+    NtFreeVirtualMemory
     NtQueryInformationProcess
+    NtQueryInformationThread
     NtQueryPerformanceCounter
     RtlFindExportedRoutineByName
     RtlInitUnicodeString
@@ -13,6 +15,7 @@ EXPORTS
     atan2
     cos
     log
+    memcmp
     memcpy
     memmove
     memset

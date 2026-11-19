@@ -42,6 +42,25 @@ for op in ['inc', 'dec']:
     for form in ['eax', 'ebx', 'esp', 'edi', 'ax', 'cx', 'dl', 'ah', 'dword ptr [esi]', 'word ptr [edi+2]']:
         t(f'{op} {form}')
     t(f'lock {op} dword ptr [esi+0x30]')
+# Flag producers followed by flag consumers (the interpreter works flags out lazily).
+for producer, u in [('cmp eax, ebx', 0), ('sub ecx, edx', 0), ('add esi, edi', 0), ('cmp al, bh', 0), ('cmp cx, dx', 0),
+                    ('and eax, ebx', AF), ('test ecx, edx', AF), ('xor ah, bl', AF), ('or ax, bx', AF), ('inc eax', 0),
+                    ('dec cl', 0), ('neg ebx', 0), ('cmp eax, dword ptr [esi+8]', 0), ('add byte ptr [esi+3], 0x7f', 0),
+                    ('sbb ecx, edx', 0), ('adc eax, ebx', 0), ('sbb dl, 0x80', 0)]:
+    for cc in ['o', 'no', 'b', 'ae', 'e', 'ne', 'be', 'a', 's', 'ns', 'p', 'np', 'l', 'ge', 'le', 'g']:
+        t(f'{producer}; set{cc} dh', u)
+    t(f'{producer}; cmovle ebp, eax; cmovb edi, ecx', u)
+    t(f'{producer}; adc ebp, edi; sbb dl, ch', u)
+    t(f'{producer}; jl 1f; mov ebp, 1; 1: jbe 2f; mov edi, 2; 2: nop', u)
+    t(f'{producer}; inc edi; setc dl; sets dh', u)
+    t(f'{producer}; pushfd; pop ebp', u)
+    t(f'{producer}; shl ebp, 3', u | AF | OF)
+    t(f'{producer}; shr edi, cl', u | AF | OF, RCX_SMALL)
+    t(f'{producer}; rcl bp, 1', u)
+# Self-modifying code: each pass changes the immediate the next one runs (restored at the end).
+t('call 1f; 1: pop edx; .byte 0x81, 0xc2; .long 2f - 1b; mov ecx, 3; 2: mov eax, 0x11111111; add ebx, eax; inc byte ptr [edx+1]; dec ecx; jnz 2b; sub byte ptr [edx+1], 3')
+t('mov ecx, 5; 1: add eax, ecx; dec ecx; jnz 1b')
+t('xor eax, eax; 1: add eax, 3; cmp eax, 30; jl 1b; sete bl')
 for op in ['neg', 'not']:
     for form in ['eax', 'cx', 'bh', 'dword ptr [esi+4]']:
         t(f'{op} {form}')

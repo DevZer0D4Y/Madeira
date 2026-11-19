@@ -75,9 +75,10 @@ Steps, in order:
 - **JIT setup** (with No JIT selected) has **Run engine check**. It runs 25
   small x86 programs, each with two inputs, through the interpreter from
   ordinary heap memory that is never executable, and compares each of the 50
-  results with the one a real x86 CPU gave for the same bytes. It reports the
-  instructions run, the rate, and whether JIT was off (`CS_DEBUGGED` clear)
-  during the check. The log gets a `[no-jit]` line with the same result.
+  results with the one a real x86 CPU gave for the same bytes, running each
+  program twice: with the decoded-instruction cache, as games run, and
+  without it. It reports the instructions run, the rate both ways, and whether
+  JIT was off (`CS_DEBUGGED` clear) during the check. The log gets a `[no-jit]` line with the same result.
 
 The programs are in `tests/x64-interp/workloads.c`, built twice. The 64-bit
 build uses the Windows x64 calling convention: CRC-32, quicksort, a prime
@@ -93,9 +94,21 @@ x87 program with C casts through `FLDCW`/`FISTP` and 64-bit integers through
 ## The interpreter
 
 `app/Madeira/X64Interpreter.c` decodes each instruction from guest memory and
-carries it out in C. Nothing is generated or cached, so self-modifying code
-and code a game's own JIT writes (Mono, .NET, LuaJIT) need nothing special.
-All state is in one `X64State` per thread.
+carries it out in C. Nothing is generated: there is no executable memory at
+all. All state is in one `X64State` per thread.
+
+Each thread can have a **decoded-instruction cache** (`X64Env.cache`, 512 KB):
+an instruction is decoded once, and the common forms (moves, `LEA`, the ALU
+operations, `TEST`, `INC`/`DEC`, `PUSH`/`POP`, jumps, calls and returns,
+`MOVZX`/`MOVSX`, `SETcc`, `CMOVcc`, `IMUL`, `MUL`/`DIV`, shifts and double
+shifts, `CDQ`) run from the decoded form; the rest run through the decoder as
+before. Each time a cached instruction runs, its bytes are compared with the
+ones it was decoded from, and it is decoded again if they changed, so
+self-modifying code and code a game's own JIT writes (Mono, .NET, LuaJIT)
+need nothing special. Arithmetic flags are worked out lazily: `ADD`, `SUB`,
+`CMP`, `ADC`, `SBB`, the logic operations, `INC` and `DEC` leave their operands,
+and the flags are computed only when something reads them (a `CMP` followed by
+a conditional jump reads just the condition).
 
 - **64-bit mode**: guest addresses are host addresses, as under FEX in Wine's
   ARM64EC process.
@@ -163,11 +176,10 @@ runtime, and reads time through `NtQueryPerformanceCounter` in a Windows build.
 That is what lets it run inside a WoW64 CPU module.
 
 Interpreting is much slower than running translated code. On the x86-64 Linux
-machine used for development (an Intel Xeon at 2.3 GHz) it runs 40 to 70
-million x86 instructions a second; the engine check reports the rate on the
-device. A cache of decoded instructions, threaded dispatch and flags computed
-only when read would make it several times faster; it will still be much
-slower than JIT, so No JIT suits older, lighter games.
+machine used for development (an Intel Xeon at 2.3 GHz) the engine check runs
+about 90 million x86 instructions a second with the cache (40 without); the
+engine check reports both rates on the device. It will still be much slower
+than JIT, so No JIT suits older, lighter games.
 
 ## The WoW64 CPU module
 
@@ -218,12 +230,12 @@ runner) does what the host it runs on allows:
 - **x86-64 Linux:** runs the committed programs natively (the 32-bit ones in a
   32-bit process with Windows' x87 control word) to confirm the expected
   results, then two instruction fuzzers. `gen-fuzz-insns.py` writes about
-  1,400 64-bit snippets (every instruction form above, in each operand size,
+  1,800 64-bit snippets (every instruction form above, in each operand size,
   with register, memory, `LOCK` and segment forms, branches taken and not);
   `fuzz.c` runs each natively and through the interpreter, at the same
   address, from the same random registers, flags, XMM registers, MXCSR
   (rounding, DAZ, FTZ) and memory, and compares every register, the defined
-  flags, MXCSR and both memory regions. `gen-fuzz-insns32.py` writes about 800
+  flags, MXCSR and both memory regions. `gen-fuzz-insns32.py` writes about 1,250
   32-bit snippets (integer code as old compilers emit it, x87, MMX); `fuzz32.c`
   runs them natively in a 32-bit process from random x87, MMX and SSE state
   (`FXRSTOR`), and `fuzz replay` compares the interpreter's registers, flags,
@@ -245,8 +257,9 @@ the registers its handler sees, and runs threads with atomics, x87 math through
 msvcrt, 64-bit division, files and sockets (system and unix calls);
 `workloads-main.c` runs the engine check's 32-bit programs. Every line is the
 same, except that msvcrt's transcendental results are compared to 1e-13. A
-simple loop there runs about 60 times slower interpreted than on the
-processor: 40 to 50 million instructions a second.
+simple loop there runs about 30 times slower interpreted than on the
+processor: about 95 million instructions a second. The module gives each
+thread its own cache and frees it when the thread ends.
 
 During development the 64-bit fuzzer ran 3.3 million comparisons over four
 seeds and the 32-bit one 1.19 million over five, with no difference, on
@@ -259,6 +272,16 @@ at random precision and rounding control: 2 million comparisons over six seeds
 with no difference, and eleven deliberate bugs in the exact arithmetic (ties to
 even, a sticky bit, denormals, overflow, a square root's last bit, the sign of
 an exact zero...) each caught.
+
+Every other fuzz run goes through the decoded-instruction cache, which keeps
+its entries from run to run, so both the cached path and the decoder alone are
+compared with the processor, and so are cache hits and code that changes under
+the cache. Snippets chain each kind of flag-setting instruction into each
+condition, `ADC`, `INC`, `PUSHF` and shifts (lazy flags carry across
+instructions), and two modify their own code as they run. Deliberate bugs in
+the cache and the lazy flags (a signed condition, `INC` keeping `CF`, a byte
+register, `MOVSX`, a segment base, the bytes check, a shift reading stale flags,
+`ADC`'s and `SBB`'s carry in and out...) were each caught.
 
 `tests/x64-interp/gen-selfcheck.py` rebuilds the programs and
 `app/Madeira/NoJITSelfCheckData.h` (it runs them natively, so it needs x86-64

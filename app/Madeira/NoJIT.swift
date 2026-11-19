@@ -42,7 +42,7 @@ final class NoJITEngine: ObservableObject {
         LogStore.shared.log("[no-jit] engine check started")
         Task.detached(priority: .userInitiated) {
             var report = MadeiraNoJITReport()
-            let size = 4096
+            let size = 16384
             var text = [CChar](repeating: 0, count: size)
             let passed = madeira_nojit_self_check(&report, &text, size)
             let lines = text.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }

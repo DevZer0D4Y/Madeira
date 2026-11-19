@@ -11,9 +11,9 @@ Everywhere (Linux or macOS, ARM64 or x86-64):
 On x86-64 Linux, also:
   - the committed programs, run natively, still give the expected results recorded in
     NoJITSelfCheckData.h (the 32-bit ones when the compiler can build -m32);
-  - the instruction fuzzer: about 1,400 64-bit snippets, each run natively and through
+  - the instruction fuzzer: about 1,800 64-bit snippets, each run natively and through
     the interpreter from the same random registers, flags, vectors, MXCSR and memory;
-  - with -m32: about 800 32-bit snippets (integer code, x87, MMX) run natively in a
+  - with -m32: about 1,250 32-bit snippets (integer code, x87, MMX) run natively in a
     32-bit process, recorded, and replayed through the interpreter's 32-bit mode.
 With qemu-aarch64 and an aarch64-linux-gnu toolchain, also:
   - the engine check, and replays of the recorded native fuzz results, on ARM64.
