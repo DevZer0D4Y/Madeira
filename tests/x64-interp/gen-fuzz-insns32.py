@@ -188,6 +188,10 @@ for i in ['fcom st(1)', 'fcomp st(2)', 'fcompp', 'fucom st(1)', 'fucomp st(3)', 
     X(f'{i}; fnstsw ax', 0, FSWAX | (CMPC1 if i == 'fxam' else 0))
 X('fcom st(1); fnstsw ax; sahf; seta cl; setb dl', 0, FSWAX)
 X('fcomp st(1); fnstsw ax; test ah, 0x41; setz bl', 0, FSWAX)
+# After a flag-setting instruction: FCOMI sets EFLAGS, FCMOVcc reads them.
+for producer in ['cmp eax, ebx', 'add ecx, edx', 'test esi, edi']:
+    X(f'{producer}; fcomi st, st(1)', AF if producer.startswith('test') else 0)
+    X(f'{producer}; fcmovbe st, st(2)', AF if producer.startswith('test') else 0)
 for i in ['fcomi st, st(1)', 'fcomip st, st(2)', 'fucomi st, st(1)', 'fucomip st, st(3)']:
     X(i)
 for cc in ['b', 'e', 'be', 'u', 'nb', 'ne', 'nbe', 'nu']:

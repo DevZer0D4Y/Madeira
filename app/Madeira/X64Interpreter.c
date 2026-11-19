@@ -1024,6 +1024,8 @@ static inline X64Vec xm(const X64State *s, const Dec *d, int bytes)
 }
 
 static int mmx(X64State *s, Dec *d, uint8_t op);
+static int sse_body(X64State *s, Dec *d, uint8_t op, int pfx, uint8_t imm);
+static int mmx_body(X64State *s, Dec *d, uint8_t op, uint8_t imm);
 static inline uint64_t mm_get(const X64State *s, int i) { return s->st[i & 7].mantissa; }
 static inline void mm_set(X64State *s, int i, uint64_t v) { s->st[i & 7].mantissa = v; s->st[i & 7].exponent = 0xffff; }
 // Any MMX instruction but EMMS: TOP 0 and every register in use.
@@ -1070,7 +1072,16 @@ static int sse(X64State *s, Dec *d, int map, uint8_t op)
         imm = fetch8(d);
     if (!finish(s, d)) return d->addr16 ? X64_EXIT_UNSUPPORTED : X64_EXIT_ILLEGAL;
     s->rip = d->next;
+    return sse_body(s, d, op, pfx, imm);
+}
 
+// The 0F 10-17, 28-2F, 50-5F, C2 and C4-C6 rows, and 60-7F and D0-FF with a
+// prefix, once decoded (d finished, rip after the instruction): also run from
+// the decoded-instruction cache.
+static int sse_body(X64State *s, Dec *d, uint8_t op, int pfx, uint8_t imm)
+{
+    int i;
+    bool sse_int = (op >= 0x60 && op <= 0x7F) || op >= 0xD0 || op == 0xC4 || op == 0xC5;
     X64Vec *a = &s->xmm[d->reg];
     X64Vec b = {{0}}, r = {{0}};
 
@@ -2227,10 +2238,18 @@ static int x87_misc(X64State *s, uint8_t low)
     return X64_EXIT_UNSUPPORTED;
 }
 
+static int x87_body(X64State *s, Dec *d, uint8_t op);
+
 static int x87(X64State *s, Dec *d, uint8_t op)
 {
     modrm(d);
     FIN();
+    return x87_body(s, d, op);
+}
+
+// D8-DF once decoded (also run from the cache).
+static int x87_body(X64State *s, Dec *d, uint8_t op)
+{
     if (d->opsize && d->mem && ((op == 0xD9 && (d->regf == 4 || d->regf == 6)) || (op == 0xDD && (d->regf == 4 || d->regf == 6))))
         return X64_EXIT_UNSUPPORTED;   // the 16-bit environment formats
     // Arithmetic rounds as the control word says: switch the host's mode when it
@@ -2393,6 +2412,12 @@ static int mmx(X64State *s, Dec *d, uint8_t op)
     uint8_t imm = 0;
     if (op == 0x70 || (op >= 0x71 && op <= 0x73) || op == 0xC4 || op == 0xC5) imm = fetch8(d);
     FIN();
+    return mmx_body(s, d, op, imm);
+}
+
+// The MMX instructions but EMMS, once decoded (also run from the cache).
+static int mmx_body(X64State *s, Dec *d, uint8_t op, uint8_t imm)
+{
     int r = d->regf;
     switch (op) {
     case 0x6C: case 0x6D: case 0xD0: case 0xD6: case 0xE6: case 0xF0: case 0xFF:
@@ -3407,6 +3432,9 @@ enum {
     FX_SHIFTD,                               // SHLD (aux 1) SHRD (aux 0); imm as FX_SHIFT
     FX_GROUP3,                               // aux: NOT NEG MUL IMUL DIV IDIV (2 to 7)
     FX_NOP, FX_CWDE, FX_CDQ,
+    // Decoded here, run by the x87, SSE and MMX code step() uses (aux: the opcode; size:
+    // the prefixes, 1 for 66, 2 for F3, 4 for F2; imm: the 8-bit immediate).
+    FX_X87, FX_SSE,
 };
 
 #define FX_NONE 0xff     // no base or index register
@@ -3503,7 +3531,7 @@ static void fx_decode(const X64State *s, FastEntry *e, uint64_t rip, const uint8
 {
     const uint8_t *p = p0;
     bool m32 = s->mode32, opsize = false;
-    uint8_t rex = 0, op;
+    uint8_t rex = 0, op, rep = 0;
     int seg = 0, regf = 0, size = 4;
     e->tag = fx_tag(s, rip);
     e->kind = FX_SLOW;
@@ -3517,8 +3545,9 @@ static void fx_decode(const X64State *s, FastEntry *e, uint64_t rip, const uint8
         op = *p;
         if (!m32 && (op & 0xF0) == 0x40) { rex = op; p++; continue; }
         if (op == 0x66) opsize = true;
+        else if (op == 0xF2 || op == 0xF3) rep = op;                    // the last one counts (SSE only, below)
         else if (op == 0x64 || op == 0x65) seg = op == 0x64 ? 4 : 5;
-        else if (op != 0x26 && op != 0x2E && op != 0x36 && op != 0x3E) break;   // F0 F2 F3 67: step()
+        else if (op != 0x26 && op != 0x2E && op != 0x36 && op != 0x3E) break;   // F0 67: step()
         rex = 0;   // a REX prefix only counts right before the opcode
         p++;
     }
@@ -3610,6 +3639,10 @@ static void fx_decode(const X64State *s, FastEntry *e, uint64_t rip, const uint8
         p = fx_modrm(e, p, m32, rex, &regf);
         if (regf < 2) { p = fx_imm(e, p, size); kind = FX_TEST_RM_I; }
         else { e->aux = (uint8_t)regf; kind = FX_GROUP3; }
+    } else if (op >= 0xD8 && op <= 0xDF) {
+        p = fx_modrm(e, p, m32, rex, &regf);
+        e->aux = op;
+        kind = FX_X87;
     } else if (op == 0xFE || op == 0xFF) {
         if (op == 0xFE) size = 1;
         p = fx_modrm(e, p, m32, rex, &regf);
@@ -3629,6 +3662,15 @@ static void fx_decode(const X64State *s, FastEntry *e, uint64_t rip, const uint8
             kind = opsize ? FX_SLOW : FX_JCC;
         } else if (op >= 0x90 && op <= 0x9F) { p = fx_modrm(e, p, m32, rex, &regf); e->aux = op & 15; size = 1; kind = FX_SETCC; }
         else if (op == 0xAF) { p = fx_modrm(e, p, m32, rex, &regf); kind = FX_IMUL_R_RM; }
+        else if ((op >= 0x10 && op <= 0x17) || (op >= 0x28 && op <= 0x2F) || (op >= 0x50 && op <= 0x5F) ||
+                 (op >= 0xC2 && op <= 0xC6 && op != 0xC3) || (op >= 0x60 && op <= 0x7F && op != 0x77) || op >= 0xD0) {
+            // What step() hands to sse() (and, without a prefix, MMX); EMMS stays with it.
+            p = fx_modrm(e, p, m32, rex, &regf);
+            if (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 || op == 0xC2 || op == 0xC4 || op == 0xC5 || op == 0xC6)
+                e->imm = *p++;
+            e->aux = op;
+            kind = FX_SSE;
+        }
         else if (op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) {
             p = fx_modrm(e, p, m32, rex, &regf);
             e->imm = (op & 1) ? 256 : *p++;
@@ -3644,12 +3686,14 @@ static void fx_decode(const X64State *s, FastEntry *e, uint64_t rip, const uint8
 done:;
     size_t len = (size_t)(p - p0);
     if (len > 15) { kind = FX_SLOW; len = 15; }   // step() reports it; 15 bytes decided that
+    if (rep && kind != FX_SSE) kind = FX_SLOW;     // REP strings, PAUSE, POPCNT...
+    if (kind == FX_X87 || kind == FX_SSE) size = (opsize ? 1 : 0) | (rep == 0xF3 ? 2 : rep == 0xF2 ? 4 : 0);
     if (kind == FX_JCC || kind == FX_JMP || kind == FX_CALL)   // the target, as EIP or RIP holds it
         e->imm = ipm(s, rip + len + e->imm);
     e->len = (uint8_t)len;
     e->size = (uint8_t)size;
     e->seg = (uint8_t)seg;
-    e->rex = rex != 0;
+    e->rex = rex;
     uint8_t bytes[16] = { 0 };
     memcpy(bytes, p0, len);
     memcpy(&e->w0, bytes, 8);
@@ -3846,6 +3890,43 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
         else if (muldiv(s, e->aux, a, size) != CONT) return FX_FALLBACK;               // a divide error: step() raises it
         break;
     }
+    case FX_X87: case FX_SSE: {
+        // The decoder's state, as step() would leave it for these.
+        Dec d;
+        memset(&d, 0, sizeof d);
+        d.start = s->rip;
+        d.next = next;
+        d.m32 = s->mode32;
+        d.gbase = s->guest_base;
+        d.rex = e->rex;
+        d.rep = (e->size & 2) ? 0xF3 : (e->size & 4) ? 0xF2 : 0;
+        d.opsize = (e->size & 1) != 0;
+        d.seg = e->seg ? e->seg : -1;
+        d.regf = e->reg & 7;
+        d.reg = e->reg;
+        d.mem = e->mem != 0;
+        if (d.mem) {
+            d.mod = 0;
+            d.base = e->base == FX_NONE || e->base == FX_RIPREL ? -1 : e->base;
+            d.riprel = e->base == FX_RIPREL;
+            d.index = e->index == FX_NONE ? -1 : e->index;
+            d.scale = e->scale;
+            d.disp = e->disp;
+            d.off = fx_offset(s, e, next);
+            d.ea = ea;
+        } else {
+            d.mod = 3;
+            d.rm = e->rm;
+            d.rmf = e->rm & 7;
+        }
+        if (s->lazy_op) flags_flush(s);   // FCOMI, COMISS and the like set EFLAGS, FCMOVcc reads them
+        s->rip = next;
+        if (e->kind == FX_X87) return x87_body(s, &d, e->aux);
+        int pfx = d.rep == 0xF3 ? 2 : d.rep == 0xF2 ? 3 : d.opsize ? 1 : 0;
+        uint8_t op = e->aux;
+        if (pfx == 0 && ((op >= 0x60 && op <= 0x7F) || op >= 0xD0 || op == 0xC4 || op == 0xC5)) return mmx_body(s, &d, op, (uint8_t)e->imm);
+        return sse_body(s, &d, op, pfx, (uint8_t)e->imm);
+    }
     case FX_NOP: break;
     case FX_CWDE: fx_setr(s, e, X64_RAX, size, (uint64_t)sext(s->gpr[X64_RAX], size / 2)); break;
     case FX_CDQ: fx_setr(s, e, X64_RDX, size, (s->gpr[X64_RAX] & sign_of(size)) ? ~0ull : 0); break;
@@ -3860,6 +3941,7 @@ X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *in
     host_set_rc((int)((s->mxcsr >> 13) & 3));
     Dec d;
     int r;
+    size_t length;
     void *cache = env->cache;
     for (;;) {
         if (s->rip == env->stop_rip || budget == 0) {
@@ -3875,18 +3957,23 @@ X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *in
             s->insn_start = start;
             if (e->tag != fx_tag(s, start) || e->kind == FX_EMPTY || !fx_same(e, code))
                 fx_decode(s, e, start, code);   // new, or changed, code
-            if (e->kind != FX_SLOW && fx_run(s, env, e) == CONT) { s->instructions++; continue; }
+            if (e->kind != FX_SLOW) {
+                r = fx_run(s, env, e);
+                if (r == CONT) { s->instructions++; continue; }
+                if (r != FX_FALLBACK) { length = e->len; goto stopped; }   // an exit, as step() gives it
+            }
         }
         flags_flush(s);   // step() reads and writes rflags itself
         r = step(s, env, &d);
         if (r == CONT) { s->instructions++; continue; }
+        length = (size_t)(d.p - d.begin);
+    stopped:
         if (r == X64_EXIT_DIVIDE_ERROR || r == X64_EXIT_ILLEGAL || r == X64_EXIT_PRIVILEGED ||
             r == X64_EXIT_UNSUPPORTED)
             s->rip = start;
         else
             s->instructions++;
         if (info) {
-            size_t length = (size_t)(d.p - d.begin);
             if (length > sizeof info->bytes) length = sizeof info->bytes;
             memset(info, 0, sizeof *info);
             info->rip = start;

@@ -255,6 +255,14 @@ t('fwait')
 
 # --- SSE ---------------------------------------------------------------------------------------
 S = lambda asm, undef=0, flags=0: t(asm, undef, flags | SSE)
+# SSE after a flag-setting instruction (COMISD sets EFLAGS), and with a segment base.
+for producer in ['cmp eax, ebx', 'add rcx, rdx', 'test esi, edi']:
+    S(f'{producer}; comisd xmm0, xmm1', AF if producer.startswith('test') else 0)
+    S(f'{producer}; ucomiss xmm2, xmm3; setb r10b', AF if producer.startswith('test') else 0)
+S('movss xmm1, dword ptr gs:[0x1010]')
+S('addsd xmm2, qword ptr gs:[0x1020]')
+S('movdqu xmmword ptr gs:[0x1030], xmm3')
+S('pshufd xmm4, xmmword ptr gs:[0x1040], 0x1b')
 for i in ['movaps xmm0, xmm1', 'movaps xmm2, xmmword ptr [rsi+0x20]', 'movaps xmmword ptr [rdi+0x30], xmm3',
           'movups xmm4, xmmword ptr [rsi+3]', 'movups xmmword ptr [rdi+5], xmm5', 'movapd xmm9, xmm10',
           'movupd xmm11, xmmword ptr [rsi+1]', 'movss xmm1, xmm2', 'movss xmm1, dword ptr [rsi+4]',

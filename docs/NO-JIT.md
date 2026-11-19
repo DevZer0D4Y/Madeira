@@ -101,7 +101,9 @@ Each thread can have a **decoded-instruction cache** (`X64Env.cache`, 512 KB):
 an instruction is decoded once, and the common forms (moves, `LEA`, the ALU
 operations, `TEST`, `INC`/`DEC`, `PUSH`/`POP`, jumps, calls and returns,
 `MOVZX`/`MOVSX`, `SETcc`, `CMOVcc`, `IMUL`, `MUL`/`DIV`, shifts and double
-shifts, `CDQ`) run from the decoded form; the rest run through the decoder as
+shifts, `CDQ`) run from the decoded form, and x87, SSE and MMX instructions run
+from it through the same code the decoder uses for them; the rest (string
+instructions, `LOCK`, system instructions...) run through the decoder as
 before. Each time a cached instruction runs, its bytes are compared with the
 ones it was decoded from, and it is decoded again if they changed, so
 self-modifying code and code a game's own JIT writes (Mono, .NET, LuaJIT)
