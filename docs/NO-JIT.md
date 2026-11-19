@@ -61,18 +61,47 @@ Steps, in order:
    What needs the device: Madeira's guest window (B is not 0 there, and the
    module follows its rules as FEX's module does, but on Linux B is 0) and
    the speed of the iPhone's cores.
-4. **The four native modules as signed code**: convert them to Mach-O when
-   Madeira is built, so the sideloader signs them with the app and iOS loads
-   them like any other library. The open upstream pull request #497 does this
-   for `ntdll`, `kernelbase` and `kernel32` (with the offline x18 rewriting) and
-   runs test programs on an iPhone with JIT off.
+4. **The native modules as signed code**: convert them to Mach-O when
+   Madeira is built, so the sideloader signs them with the app and iOS runs
+   them like any other library. The open upstream pull request #497 (another
+   contributor's) does this without changing their code: `build/signed-pe/
+   prepare.py` maps a PE's sections into a Mach-O image, its data relocations
+   becoming dyld rebases, and Wine's loader runs a prepared image's code from
+   the signed copy (`MADEIRA_SIGNED_PE_DIR`). It is built for ARM64EC, and
+   has run Wine's `ntdll` that way on an iPhone with JIT off. For the 32-bit
+   path, whose four modules are plain ARM64, checked against its rules:
+   - `wow64.dll` and `wow64win.dll` already have the layout it needs (64 KiB
+     sections, no relocations in code, no pointers outside the image). They
+     read the TEB through x18 49 and 38 times, all in simple forms.
+   - `wow64interp.dll` is built for it (`build.sh` links it as winegcc links
+     Wine's modules), and `check-x64-interpreter.py` checks its layout and its
+     10 x18 reads, all `mov`.
+   - `ntdll.dll` has 258 relocations in its code, all the same thing: each
+     system call stub's literal holding `__wine_syscall_dispatcher`'s address
+     (Wine's ARM64 `__ASM_SYSCALL_FUNC` in `include/wine/asm.h`). The ARM64EC
+     stub already loads it PC-relatively (`adrp`/`ldr`), and the same change to
+     the ARM64 stub removes them. It also has one x18 store, in the routine
+     that captures a context.
+   - The pull request's offline TEB rewriting uses x13 and x14, which ARM64EC
+     reserves and plain ARM64 does not, so these modules need their own: for
+     example Madeira's load-time `ios_jit_patch_x18`, which already handles
+     every x18 form they use but that store, run when the app is built.
+   - A signed library has one copy of its data, and every Windows process in
+     Madeira is a pseudo-process in the same iOS process: two processes that
+     load `ntdll.dll` need two copies, and the pull request's loader refuses a
+     second one. A 32-bit game's process is one; the 64-bit helpers a session
+     may start (`services.exe`, `rpcss.exe`, `explorer.exe`) are more, and
+     their own DLLs are native code too. Signing a few numbered copies of each
+     module, and starting no helper a game does not need, would cover a
+     session.
 5. **A 32-bit session that starts without the JIT pool**: skip
    `StikJITHelper`'s pool for No JIT, and have the loader use the signed copies.
 6. **Speed**, below.
 
 64-bit games need more: every one of Wine's ARM64EC modules as signed code
-(416 files today), and an interpreter-backed version of FEX's ARM64EC module
-(`libarm64ecfex.dll`, Wine's `BTCpu64` interface).
+(416 files today; pull request #497 works toward that, with FEX translating
+programs ahead of time), and for the interpreter, a version of FEX's ARM64EC
+module that interprets (`libarm64ecfex.dll`, Wine's `BTCpu64` interface).
 
 ## What the option does now
 

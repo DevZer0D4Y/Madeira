@@ -59,7 +59,11 @@ if [ ${#arm64[@]} -gt 0 ] && command -v llvm-dlltool >/dev/null; then
     mkdir -p "$dir"
     llvm-dlltool -m arm64 -d "$here/ntdll-imports.def" -l "$dir/libntdll.a"
     llvm-dlltool -m arm64 -d "$here/wow64-imports.def" -l "$dir/libwow64.a"
+    # 64 KiB sections, linked as winegcc links Wine's own ARM64 modules: code and data on
+    # separate 16 KiB pages, so the module can be wrapped as a signed Mach-O image later
+    # (docs/NO-JIT.md, step 4).
     "${arm64[@]}" "${cflags[@]}" -shared -nostdlib -Wl,--entry,DllMain -Wl,--no-insert-timestamp \
+        -Wl,-Xlink=-filealign:0x1000,-Xlink=-align:0x10000,-Xlink=-driver \
         -o "$dir/wow64interp.dll" "${sources[@]}" "$here/wow64interp.def" -L"$dir" -lntdll -lwow64
     echo "$dir/wow64interp.dll"
     built=$((built + 1))

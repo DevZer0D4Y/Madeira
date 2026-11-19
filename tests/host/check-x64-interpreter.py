@@ -45,6 +45,46 @@ def check(condition, label, detail=''):
             print(detail.rstrip())
 
 
+def signed_layout_problems(raw):
+    """What would stop a PE from being wrapped, its code unchanged, as a signed Mach-O
+    image: data starting on a 16 KiB page after all code, DIR64 relocations only and
+    none in code, every relocated pointer inside the image."""
+    import struct
+    nt = struct.unpack_from('<I', raw, 60)[0]
+    count, optional_size = struct.unpack_from('<H', raw, nt + 6)[0], struct.unpack_from('<H', raw, nt + 20)[0]
+    optional = nt + 24
+    base, size = struct.unpack_from('<Q', raw, optional + 24)[0], struct.unpack_from('<I', raw, optional + 56)[0]
+    image, sections, problems = bytearray(size), [], []
+    for i in range(count):
+        off = optional + optional_size + 40 * i
+        virtual, rva, length, position = struct.unpack_from('<IIII', raw, off + 8)
+        image[rva:rva + length] = raw[position:position + length]
+        sections.append((rva, rva + max(virtual, length), struct.unpack_from('<I', raw, off + 36)[0]))
+    code = [s for s in sections if s[2] & 0x20000000]
+    data_start = min(s[0] for s in sections if not s[2] & 0x20000000)
+    if data_start % 16384 or any(end > data_start for _, end, _ in code):
+        problems.append(f'data starts at {data_start:#x}: not on a 16 KiB page after the code')
+    if any(flags & 0x80000000 for _, _, flags in code):
+        problems.append('writable code')
+    rva, length = struct.unpack_from('<II', raw, optional + 112 + 5 * 8)
+    off = rva
+    while off < rva + length:
+        page, block = struct.unpack_from('<II', image, off)
+        for index in range(off + 8, off + block, 2):
+            value = struct.unpack_from('<H', image, index)[0]
+            target = page + (value & 4095)
+            if not value >> 12:
+                continue
+            if value >> 12 != 10:
+                problems.append(f'relocation type {value >> 12} at {target:#x}')
+            elif any(start <= target < end for start, end, _ in code):
+                problems.append(f'relocation in code at {target:#x}')
+            elif not base <= struct.unpack_from('<Q', image, target)[0] < base + size:
+                problems.append(f'pointer outside the image at {target:#x}')
+        off += block
+    return problems
+
+
 def run(*args, **kwargs):
     return subprocess.run([str(a) for a in args], capture_output=True, text=True, **kwargs)
 # fuzz-common.h is shared by programs that use only part of it.
@@ -195,6 +235,9 @@ with tempfile.TemporaryDirectory(prefix='x64-interp-') as folder:
                     or re.search(r'\badd\b\s+x[0-9]+, x[0-9]+, x18\b', u))]
                 check(uses and not odd, f'aarch64 module reads x18 (the TEB) only in forms the loader rewrites: {len(uses)} uses',
                       '\n'.join(odd[:20]))
+                problems = signed_layout_problems(dll.read_bytes())
+                check(not problems, 'aarch64 module has the layout a signed Mach-O wrapper needs (16 KiB-aligned data '
+                      'after the code, no relocations in code, no pointers outside the image)', '\n'.join(problems))
     else:
         print('NOTE: no mingw-w64 GCC or clang with lld: the WoW64 CPU module was not built')
 
