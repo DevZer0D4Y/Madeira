@@ -213,10 +213,16 @@ static void rnd_x87_full(uint8_t *slot)
     uint64_t m = rnd() | 0x8000000000000000ull;
     uint64_t r = rnd();
     uint16_t sign = (uint16_t)(r & 0x8000);
-    unsigned kind = (unsigned)((r >> 16) % 18);
+    unsigned kind = (unsigned)((r >> 16) % 22);
     unsigned e;
-    if (kind >= 16) m = kind == 16 ? ~0ull : 0x8000000000000000ull;   // all ones (carries; a square root just below a half), a power of two
+    if (kind == 16 || kind == 17) m = kind == 16 ? ~0ull : 0x8000000000000000ull;   // all ones (carries; a square root just below a half), a power of two
     switch (kind) {
+    case 18: case 19:   // around float's and double's denormals (FST m32, m64); all ones rounds up into the normals
+        e = kind == 18 ? 16383 - 126 - 30 + (unsigned)((r >> 24) % 40) : 16383 - 1022 - 60 + (unsigned)((r >> 24) % 70);
+        if (!((r >> 40) & 3)) { m = ~0ull; e = kind == 18 ? 16383 - 127 : 16383 - 1023; }
+        break;
+    case 20: e = 16383 + 125 + (unsigned)((r >> 24) % 5); break;          // around float's largest
+    case 21: e = 16383 + 1021 + (unsigned)((r >> 24) % 5); break;         // around double's
     case 0: put_f80(slot, 0, sign); return;                                             // zero
     case 1: put_f80(slot, 0x8000000000000000ull, sign | 0x7fff); return;                 // infinity
     case 2: put_f80(slot, m | ((r >> 24) & 1 ? 0x4000000000000000ull : 0), sign | 0x7fff); return;   // a NaN

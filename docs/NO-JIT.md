@@ -134,7 +134,8 @@ Implemented:
   operands (unnormals, pseudo-NaNs, an empty register). Values a double holds
   take the host's double arithmetic at 24 and 53 bits; the rest, and all of
   64-bit precision, take integer arithmetic on the 64-bit significands.
-  `FSCALE`, `FRNDINT`, `FXTRACT`, conversions and comparisons are exact too.
+  `FSCALE`, `FRNDINT`, `FXTRACT`, conversions and comparisons are exact too
+  (`FST m32` and `FST m64` round once, to denormals as well).
   Transcendental results (`FSIN`, `FPTAN`, `FYL2X`, `F2XM1`...) are double's,
   which can differ from the x87's in the last bit or two (the x87 does not
   round these correctly either, and Intel's and AMD's differ); far from zero,

@@ -1632,14 +1632,6 @@ static inline bool f80_unsupported(X87Reg v)
 static inline bool f80_neg(X87Reg v) { return (v.exponent & 0x8000) != 0; }
 static inline X87Reg f80_quiet(X87Reg v) { v.mantissa |= 0x4000000000000000ull; return v; }
 
-// Exact multiplication by 2^k within double's range, in steps outside it.
-static double scale2(double m, int k)
-{
-    while (k > 1000) { m *= 0x1p1000; k -= 1000; if (isinf(m)) return m; }
-    while (k < -1000) { m *= 0x1p-1000; k += 1000; if (m == 0) return m; }
-    return m * u2d((uint64_t)(k + 1023) << 52);
-}
-
 static X87Reg f80_from_f64(uint64_t bits)
 {
     X87Reg r = { 0, 0, { 0, 0, 0 } };
@@ -1681,41 +1673,69 @@ static X87Reg f80_from_int(int64_t i)
     return f80_from_magnitude(i < 0, i < 0 ? 0 - (uint64_t)i : (uint64_t)i);
 }
 
-// The significand with a sticky bit, signed: one rounding to 53 or 24 bits in
-// the right direction for the sign.
-static inline int64_t f80_signed_half(X87Reg v)
+// v's bits as a double, when a normal double holds it exactly.
+static inline bool f80_double_bits(X87Reg v, uint64_t *bits)
 {
-    uint64_t half = (v.mantissa >> 1) | (v.mantissa & 1);
-    return f80_neg(v) ? -(int64_t)half : (int64_t)half;
+    unsigned e = v.exponent & 0x7fff;
+    if (e < 16383 - 1022 || e > 16383 + 1023 || !(v.mantissa >> 63) || (v.mantissa & 0x7ff)) return false;
+    *bits = ((uint64_t)(v.exponent & 0x8000) << 48) | ((uint64_t)(e - 16383 + 1023) << 52) | ((v.mantissa >> 11) & 0x000fffffffffffffull);
+    return true;
+}
+
+typedef unsigned __int128 u128;
+
+// v as an IEEE number with `frac` fraction bits and `ebits` exponent bits (float:
+// 23 and 8, double: 52 and 11), rounded once, in the host's rounding direction
+// (x87() sets it from the control word), to a normal or denormal result: what
+// FST m32 and FST m64 store.
+static uint64_t f80_to_ieee(X87Reg v, int frac, int ebits)
+{
+    int e = v.exponent & 0x7fff;
+    bool neg = f80_neg(v);
+    uint64_t sign = (uint64_t)neg << (frac + ebits), ones = (1ull << ebits) - 1, fmask = (1ull << frac) - 1;
+    if (f80_unsupported(v)) return (1ull << (frac + ebits)) | (ones << frac) | (1ull << (frac - 1));   // the default NaN
+    if (e == 0x7fff) {
+        if (!(v.mantissa << 1)) return sign | (ones << frac);                                           // infinity
+        return sign | (ones << frac) | (1ull << (frac - 1)) | ((v.mantissa >> (63 - frac)) & fmask);    // a NaN, quieted
+    }
+    if (!v.mantissa) return sign;
+    int lz = __builtin_clzll(v.mantissa);
+    uint64_t m = v.mantissa << lz;
+    int exp = (e ? e : 1) - 16383 - lz;               // of m's top bit
+    int bias = (1 << (ebits - 1)) - 1, emin = 1 - bias;
+    int shift = 63 - frac;                            // the bits a normal result drops
+    if (exp < emin) shift += emin - exp;              // a denormal keeps fewer
+    if (shift > 126) shift = 126;
+    u128 unit = (u128)1 << shift, low = (u128)m & (unit - 1), half = unit >> 1;
+    uint64_t q = (uint64_t)((u128)m >> shift);
+    bool up;
+    switch (host_get_rc()) {
+    case 0: up = low > half || (low == half && (q & 1)); break;
+    case 1: up = neg && low; break;
+    case 2: up = !neg && low; break;
+    default: up = false; break;
+    }
+    q += up;
+    if (exp < emin) return sign | ((q >> frac) << frac) | (q & fmask);   // rounding up to the smallest normal sets its exponent
+    if (q >> (frac + 1)) { q >>= 1; exp++; }
+    if (exp > bias) {                                 // overflow: infinity, or the largest finite number
+        int rc = host_get_rc();
+        if (rc == 0 || (rc == 1 && neg) || (rc == 2 && !neg)) return sign | (ones << frac);
+        return sign | ((ones - 1) << frac) | fmask;
+    }
+    return sign | ((uint64_t)(exp + bias) << frac) | (q & fmask);
 }
 
 static double f80_to_double(X87Reg v)
 {
-    int e = v.exponent & 0x7fff;
-    if (f80_unsupported(v)) return u2d(0xfff8000000000000ull);   // the default NaN
-    if (e == 0x7fff) {
-        if (!(v.mantissa << 1)) return f80_neg(v) ? -INFINITY : INFINITY;
-        return u2d((f80_neg(v) ? 0x8000000000000000ull : 0) | 0x7ff8000000000000ull | ((v.mantissa >> 11) & 0x0007ffffffffffffull));
-    }
-    if (!v.mantissa) return f80_neg(v) ? -0.0 : 0.0;
-    volatile double m = (double)f80_signed_half(v);
-    return scale2(m, (e ? e : 1) - 16383 - 62);
+    uint64_t exact;
+    if (f80_double_bits(v, &exact)) return u2d(exact);   // no rounding to do
+    return u2d(f80_to_ieee(v, 52, 11));
 }
 
 static uint32_t f80_to_f32(X87Reg v)
 {
-    int e = v.exponent & 0x7fff;
-    uint32_t sign = f80_neg(v) ? 0x80000000u : 0;
-    if (f80_unsupported(v)) return 0xffc00000u;
-    if (e == 0x7fff) {
-        if (!(v.mantissa << 1)) return sign | 0x7f800000u;
-        return sign | 0x7fc00000u | (uint32_t)((v.mantissa >> 40) & 0x3fffff);
-    }
-    if (!v.mantissa) return sign;
-    volatile float m = (float)f80_signed_half(v);
-    volatile double r = scale2((double)m, (e ? e : 1) - 16383 - 62);
-    volatile float f = (float)r;
-    return f2u(f);
+    return (uint32_t)f80_to_ieee(v, 23, 8);
 }
 
 // Rounds the magnitude to an integer: rc 0 nearest even, 1 down, 2 up, 3 toward
@@ -1789,8 +1809,6 @@ static int f80_cmp(X87Reg a, X87Reg b)
 // result rounded again to 24 bits is the correctly rounded one (53 >= 2 * 24 + 2).
 // Everything else, and all of 64-bit precision, takes integer arithmetic on the
 // 64-bit significands, rounded once by f80_pack.
-
-typedef unsigned __int128 u128;
 
 enum { F80_ZERO, F80_FINITE, F80_INF, F80_NAN, F80_BAD };
 
@@ -1927,8 +1945,37 @@ static X87Reg f80_sqrt(X87Reg a, uint16_t fcw)
 
 enum { X87_ADD, X87_MUL, X87_COM, X87_COMP, X87_SUB, X87_SUBR, X87_DIV, X87_DIVR };
 
+static X87Reg f80_arith_full(int op, X87Reg a, X87Reg b, uint16_t fcw);
+
 // `a` is the destination: SUB is a - b, SUBR b - a.
-static X87Reg f80_arith(int op, X87Reg a, X87Reg b, uint16_t fcw)
+static inline X87Reg f80_arith(int op, X87Reg a, X87Reg b, uint16_t fcw)
+{
+    // The common case first: 53-bit precision (or 24), two normal doubles, a result strictly
+    // inside the normal doubles. Rounded by the host in the control word's direction (x87()).
+    uint64_t pa, pb;
+    if (((fcw & 0x300) == 0x200 || (fcw & 0x300) == 0) && f80_double_bits(a, &pa) && f80_double_bits(b, &pb)) {
+        double p = u2d(pa), q = u2d(pb);
+        volatile double r;
+        switch (op) {
+        case X87_ADD: r = p + q; break;
+        case X87_MUL: r = p * q; break;
+        case X87_SUB: r = p - q; break;
+        case X87_SUBR: r = q - p; break;
+        case X87_DIV: r = p / q; break;
+        default: r = q / p; break;
+        }
+        uint64_t rb = d2u(r), magnitude = rb & 0x7fffffffffffffffull;
+        if (magnitude > 0x0010000000000000ull && magnitude < 0x7fefffffffffffffull) {
+            X87Reg v = { 0x8000000000000000ull | ((rb & 0x000fffffffffffffull) << 11),
+                         (uint16_t)(((rb >> 48) & 0x8000) | (((rb >> 52) & 0x7ff) - 1023 + 16383)), { 0, 0, 0 } };
+            return (fcw & 0x300) ? v : f80_to_precision(v, 24, (fcw >> 10) & 3);
+        }
+    }
+    return f80_arith_full(op, a, b, fcw);
+}
+
+// Everything else: exactly, at any precision (f80_pack).
+static __attribute__((noinline)) X87Reg f80_arith_full(int op, X87Reg a, X87Reg b, uint16_t fcw)
 {
     F80Parts x = f80_parts(a), y = f80_parts(b);
     if (x.kind == F80_BAD || y.kind == F80_BAD) return F80_INDEFINITE;
@@ -2238,32 +2285,31 @@ static int x87_misc(X64State *s, uint8_t low)
     return X64_EXIT_UNSUPPORTED;
 }
 
-static int x87_body(X64State *s, Dec *d, uint8_t op);
+static int x87_body(X64State *s, uint8_t op, int regf, int rmf, bool mem, uint64_t ea, bool opsize);
 
 static int x87(X64State *s, Dec *d, uint8_t op)
 {
     modrm(d);
     FIN();
-    return x87_body(s, d, op);
+    return x87_body(s, op, d->regf, d->rmf, d->mem, d->ea, d->opsize);
 }
 
 // D8-DF once decoded (also run from the cache).
-static int x87_body(X64State *s, Dec *d, uint8_t op)
+static int x87_body(X64State *s, uint8_t op, int regf, int rmf, bool mem, uint64_t ea, bool opsize)
 {
-    if (d->opsize && d->mem && ((op == 0xD9 && (d->regf == 4 || d->regf == 6)) || (op == 0xDD && (d->regf == 4 || d->regf == 6))))
+    if (opsize && mem && ((op == 0xD9 && (regf == 4 || regf == 6)) || (op == 0xDD && (regf == 4 || regf == 6))))
         return X64_EXIT_UNSUPPORTED;   // the 16-bit environment formats
     // Arithmetic rounds as the control word says: switch the host's mode when it
     // differs from MXCSR's, which x64_run keeps it at.
     int rc = (s->fcw >> 10) & 3, sse_rc = (s->mxcsr >> 13) & 3;
     if (rc != sse_rc) host_set_rc(rc);
     int result = CONT;
-    int reg = d->rmf;
-    uint64_t ea = d->ea;
+    int reg = rmf;
     X87Reg v;
     int64_t i64;
 
-    if (d->mem) {
-        switch ((op << 3 | d->regf) & 0x3f) {   // (op & 7) << 3 | reg
+    if (mem) {
+        switch ((op << 3 | regf) & 0x3f) {   // (op & 7) << 3 | reg
         // D8/DC/DA/DE: ST0 = ST0 op m32fp / m64fp / m32int / m16int
         case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
         case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
@@ -2275,16 +2321,16 @@ static int x87_body(X64State *s, Dec *d, uint8_t op)
             case 0xDA: v = f80_from_int((int32_t)mem_read(ea, 4)); break;
             default: v = f80_from_int((int16_t)mem_read(ea, 2)); break;
             }
-            if (d->regf == X87_COM || d->regf == X87_COMP) {
+            if (regf == X87_COM || regf == X87_COMP) {
                 x87_compare(s, x87_get(s, 0), v, false);
-                if (d->regf == X87_COMP) x87_pop(s);
+                if (regf == X87_COMP) x87_pop(s);
             } else {
-                x87_put(s, 0, x87_valid(s, 0) ? f80_arith(d->regf, x87_get(s, 0), v, s->fcw) : F80_INDEFINITE);
+                x87_put(s, 0, x87_valid(s, 0) ? f80_arith(regf, x87_get(s, 0), v, s->fcw) : F80_INDEFINITE);
             }
             break;
         case 0x08: v = f80_from_f32((uint32_t)mem_read(ea, 4)); x87_push(s, f80_nan(v) ? f80_quiet(v) : v); break;   // FLD m32
         case 0x0A: case 0x0B: mem_write(ea, 4, f80_to_f32(x87_get(s, 0)));               // FST(P) m32
-            if (d->regf == 3) x87_pop(s);
+            if (regf == 3) x87_pop(s);
             break;
         case 0x0C: x87_load_env(s, ea); break;                                             // FLDENV
         case 0x0D: s->fcw = (uint16_t)mem_read(ea, 2); break;                              // FLDCW
@@ -2292,25 +2338,25 @@ static int x87_body(X64State *s, Dec *d, uint8_t op)
         case 0x0F: mem_write(ea, 2, s->fcw); break;                                        // FNSTCW
         case 0x18: x87_push(s, f80_from_int((int32_t)mem_read(ea, 4))); break;            // FILD m32
         case 0x19: case 0x1A: case 0x1B:                                                   // FISTTP FIST FISTP m32
-            if (!f80_to_int(x87_get(s, 0), d->regf == 1 ? 3 : rc, &i64) || i64 != (int32_t)i64) i64 = INT32_MIN;
+            if (!f80_to_int(x87_get(s, 0), regf == 1 ? 3 : rc, &i64) || i64 != (int32_t)i64) i64 = INT32_MIN;
             mem_write(ea, 4, (uint32_t)i64);
-            if (d->regf != 2) x87_pop(s);
+            if (regf != 2) x87_pop(s);
             break;
         case 0x1D: memcpy(&v, (const void *)(uintptr_t)ea, 10); v.pad[0] = v.pad[1] = v.pad[2] = 0; x87_push(s, v); break;   // FLD m80
         case 0x1F: v = x87_get(s, 0); memcpy((void *)(uintptr_t)ea, &v, 10); x87_pop(s); break;                           // FSTP m80
         case 0x28: v = f80_from_f64(mem_read(ea, 8)); x87_push(s, f80_nan(v) ? f80_quiet(v) : v); break;             // FLD m64
         case 0x29: case 0x3F:                                                              // FISTTP m64 (DD /1), FISTP m64 (DF /7)
-            if (!f80_to_int(x87_get(s, 0), d->regf == 1 ? 3 : rc, &i64)) i64 = INT64_MIN;
+            if (!f80_to_int(x87_get(s, 0), regf == 1 ? 3 : rc, &i64)) i64 = INT64_MIN;
             mem_write(ea, 8, (uint64_t)i64);
             x87_pop(s);
             break;
         case 0x39: case 0x3A: case 0x3B:                                                   // FISTTP FIST FISTP m16
-            if (!f80_to_int(x87_get(s, 0), d->regf == 1 ? 3 : rc, &i64) || i64 != (int16_t)i64) i64 = INT16_MIN;
+            if (!f80_to_int(x87_get(s, 0), regf == 1 ? 3 : rc, &i64) || i64 != (int16_t)i64) i64 = INT16_MIN;
             mem_write(ea, 2, (uint16_t)i64);
-            if (d->regf != 2) x87_pop(s);
+            if (regf != 2) x87_pop(s);
             break;
         case 0x2A: case 0x2B: mem_write(ea, 8, d2u(f80_to_double(x87_get(s, 0))));       // FST(P) m64
-            if (d->regf == 3) x87_pop(s);
+            if (regf == 3) x87_pop(s);
             break;
         case 0x2C:                                                                         // FRSTOR
             x87_load_env(s, ea);
@@ -2336,58 +2382,58 @@ static int x87_body(X64State *s, Dec *d, uint8_t op)
         X87Reg t0 = x87_get(s, 0), ti = x87_get(s, reg);
         switch (op) {
         case 0xD8:                                                       // ST0 = ST0 op ST(i)
-            if (d->regf == X87_COM || d->regf == X87_COMP) { x87_compare(s, t0, ti, false); if (d->regf == X87_COMP) x87_pop(s); }
-            else x87_put(s, 0, x87_valid(s, 0) && x87_valid(s, reg) ? f80_arith(d->regf, t0, ti, s->fcw) : F80_INDEFINITE);
+            if (regf == X87_COM || regf == X87_COMP) { x87_compare(s, t0, ti, false); if (regf == X87_COMP) x87_pop(s); }
+            else x87_put(s, 0, x87_valid(s, 0) && x87_valid(s, reg) ? f80_arith(regf, t0, ti, s->fcw) : F80_INDEFINITE);
             break;
         case 0xDC: case 0xDE:                                            // ST(i) = ST(i) op ST0 (SUB/SUBR and DIV/DIVR swap)
-            if (op == 0xDE && d->regf == 3 && reg != 1) { result = X64_EXIT_ILLEGAL; break; }
-            if (d->regf == X87_COM || d->regf == X87_COMP) {
+            if (op == 0xDE && regf == 3 && reg != 1) { result = X64_EXIT_ILLEGAL; break; }
+            if (regf == X87_COM || regf == X87_COMP) {
                 x87_compare(s, t0, ti, false);
-                if (d->regf == X87_COMP || op == 0xDE) x87_pop(s);
-                if (op == 0xDE && d->regf == 3) x87_pop(s);              // FCOMPP
+                if (regf == X87_COMP || op == 0xDE) x87_pop(s);
+                if (op == 0xDE && regf == 3) x87_pop(s);              // FCOMPP
                 break;
             }
-            x87_put(s, reg, x87_valid(s, 0) && x87_valid(s, reg) ? f80_arith(d->regf >= 4 ? d->regf ^ 1 : d->regf, ti, t0, s->fcw)
+            x87_put(s, reg, x87_valid(s, 0) && x87_valid(s, reg) ? f80_arith(regf >= 4 ? regf ^ 1 : regf, ti, t0, s->fcw)
                                                                   : F80_INDEFINITE);   // an empty register: stack underflow
             if (op == 0xDE) x87_pop(s);
             break;
         case 0xD9:
-            switch (d->regf) {
+            switch (regf) {
             case 0: x87_push(s, ti); break;                              // FLD ST(i)
             case 1: x87_put(s, 0, ti); x87_put(s, reg, t0); break;       // FXCH
             case 2: if (reg) result = X64_EXIT_ILLEGAL; break;           // FNOP
             case 3: x87_put(s, reg, t0); x87_pop(s); break;              // FSTP1
-            default: result = x87_misc(s, (uint8_t)(0xC0 | d->regf << 3 | reg)); break;
+            default: result = x87_misc(s, (uint8_t)(0xC0 | regf << 3 | reg)); break;
             }
             break;
         case 0xDA: case 0xDB:
-            if (d->regf < 4) {                                           // FCMOVcc
+            if (regf < 4) {                                           // FCMOVcc
                 static const uint64_t flag[4] = { FL_CF, FL_ZF, FL_CF | FL_ZF, FL_PF };
-                bool c = (s->rflags & flag[d->regf]) != 0;
+                bool c = (s->rflags & flag[regf]) != 0;
                 if (op == 0xDB) c = !c;
                 if (!x87_valid(s, 0) || !x87_valid(s, reg)) x87_put(s, 0, F80_INDEFINITE);
                 else if (c) x87_put(s, 0, ti);
-            } else if (op == 0xDA && d->regf == 5 && reg == 1) {         // FUCOMPP
+            } else if (op == 0xDA && regf == 5 && reg == 1) {         // FUCOMPP
                 x87_compare(s, t0, ti, false); x87_pop(s); x87_pop(s);
-            } else if (op == 0xDB && d->regf == 4) {
+            } else if (op == 0xDB && regf == 4) {
                 if (reg == 2) s->fsw &= 0x7f00;                          // FNCLEX
                 else if (reg == 3) x87_init(s);                          // FNINIT
                 else if (reg > 4) result = X64_EXIT_ILLEGAL;             // FENI, FDISI, FSETPM: no-ops
-            } else if (op == 0xDB && (d->regf == 5 || d->regf == 6)) {   // FUCOMI FCOMI
+            } else if (op == 0xDB && (regf == 5 || regf == 6)) {   // FUCOMI FCOMI
                 x87_compare(s, t0, ti, true);
             } else result = X64_EXIT_ILLEGAL;
             break;
         case 0xDD:
-            switch (d->regf) {
+            switch (regf) {
             case 0: s->ftw &= (uint8_t)~(1 << ((x87_top(s) + reg) & 7)); break;   // FFREE
             case 1: x87_put(s, 0, ti); x87_put(s, reg, t0); break;       // FXCH4
-            case 2: case 3: x87_put(s, reg, t0); if (d->regf == 3) x87_pop(s); break;   // FST(P) ST(i)
-            case 4: case 5: x87_compare(s, t0, ti, false); if (d->regf == 5) x87_pop(s); break;   // FUCOM(P)
+            case 2: case 3: x87_put(s, reg, t0); if (regf == 3) x87_pop(s); break;   // FST(P) ST(i)
+            case 4: case 5: x87_compare(s, t0, ti, false); if (regf == 5) x87_pop(s); break;   // FUCOM(P)
             default: result = X64_EXIT_ILLEGAL; break;
             }
             break;
         default: // 0xDF
-            switch (d->regf) {
+            switch (regf) {
             case 0: s->ftw &= (uint8_t)~(1 << ((x87_top(s) + reg) & 7)); x87_pop(s); break;   // FFREEP
             case 1: x87_put(s, 0, ti); x87_put(s, reg, t0); break;       // FXCH7
             case 2: case 3: x87_put(s, reg, t0); x87_pop(s); break;      // FSTP8/9
@@ -3469,8 +3515,10 @@ static inline uint64_t load64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); 
 // Whether the bytes at p are still the entry's.
 static inline bool fx_same(const FastEntry *e, const uint8_t *p)
 {
-    if (((uintptr_t)p & 4095) <= 4096 - 16)   // both words on one page: no fault past its end
+    if (((uintptr_t)p & 4095) <= 4096 - 16) {  // both words on one page: no fault past its end
+        if (!e->m1) return !((load64(p) ^ e->w0) & e->m0);
         return !(((load64(p) ^ e->w0) & e->m0) | ((load64(p + 8) ^ e->w1) & e->m1));
+    }
     uint8_t bytes[16];
     memcpy(bytes, &e->w0, 8);
     memcpy(bytes + 8, &e->w1, 8);
@@ -3890,10 +3938,20 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
         else if (muldiv(s, e->aux, a, size) != CONT) return FX_FALLBACK;               // a divide error: step() raises it
         break;
     }
-    case FX_X87: case FX_SSE: {
+    case FX_X87:
+        if (s->lazy_op) flags_flush(s);   // FCOMI sets EFLAGS, FCMOVcc reads them
+        s->rip = next;
+        return x87_body(s, e->aux, e->reg & 7, e->rm & 7, e->mem != 0, ea, (e->size & 1) != 0);
+    case FX_SSE: {
         // The decoder's state, as step() would leave it for these.
         Dec d;
-        memset(&d, 0, sizeof d);
+        d.begin = d.p = NULL;   // nothing more is fetched
+        d.addrsize = d.lock = d.riprel = d.addr16 = false;
+        d.base = d.index = -1;
+        d.scale = 0;
+        d.disp = 0;
+        d.off = d.ea = 0;
+        d.rm = d.rmf = 0;
         d.start = s->rip;
         d.next = next;
         d.m32 = s->mode32;
@@ -3919,9 +3977,8 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
             d.rm = e->rm;
             d.rmf = e->rm & 7;
         }
-        if (s->lazy_op) flags_flush(s);   // FCOMI, COMISS and the like set EFLAGS, FCMOVcc reads them
+        if (s->lazy_op) flags_flush(s);   // COMISS and the like set EFLAGS
         s->rip = next;
-        if (e->kind == FX_X87) return x87_body(s, &d, e->aux);
         int pfx = d.rep == 0xF3 ? 2 : d.rep == 0xF2 ? 3 : d.opsize ? 1 : 0;
         uint8_t op = e->aux;
         if (pfx == 0 && ((op >= 0x60 && op <= 0x7F) || op >= 0xD0 || op == 0xC4 || op == 0xC5)) return mmx_body(s, &d, op, (uint8_t)e->imm);
