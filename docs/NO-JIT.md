@@ -70,22 +70,54 @@ Steps, in order:
    the signed copy (`MADEIRA_SIGNED_PE_DIR`). It is built for ARM64EC, and
    has run Wine's `ntdll` that way on an iPhone with JIT off. For the 32-bit
    path, whose four modules are plain ARM64, checked against its rules:
-   - `wow64.dll` and `wow64win.dll` already have the layout it needs (64 KiB
-     sections, no relocations in code, no pointers outside the image). They
-     read the TEB through x18 49 and 38 times, all in simple forms.
-   - `wow64interp.dll` is built for it (`build.sh` links it as winegcc links
-     Wine's modules), and `check-x64-interpreter.py` checks its layout and its
-     10 x18 reads, all `mov`.
-   - `ntdll.dll` has 258 relocations in its code, all the same thing: each
-     system call stub's literal holding `__wine_syscall_dispatcher`'s address
-     (Wine's ARM64 `__ASM_SYSCALL_FUNC` in `include/wine/asm.h`). The ARM64EC
-     stub already loads it PC-relatively (`adrp`/`ldr`), and the same change to
-     the ARM64 stub removes them. It also has one x18 store, in the routine
-     that captures a context.
-   - The pull request's offline TEB rewriting uses x13 and x14, which ARM64EC
-     reserves and plain ARM64 does not, so these modules need their own: for
-     example Madeira's load-time `ios_jit_patch_x18`, which already handles
-     every x18 form they use but that store, run when the app is built.
+   - `wow64.dll`, `wow64win.dll` and `wow64interp.dll` already have the layout
+     it needs (64 KiB sections, no relocations in code, no pointers outside the
+     image; `build.sh` links `wow64interp.dll` as winegcc links Wine's modules,
+     and `check-x64-interpreter.py` checks it). `ntdll.dll` has 258 relocations
+     in its code, all the same thing: each system call stub's literal holding
+     `__wine_syscall_dispatcher`'s address (Wine's ARM64 `__ASM_SYSCALL_FUNC`
+     in `include/wine/asm.h`).
+   - All four read the TEB through x18: 661, 49, 38 and 10 times. The pull
+     request's offline TEB rewriting uses x13 and x14, which ARM64EC reserves
+     and plain ARM64 does not.
+
+   `build/signed-arm64/rewrite.py` (done) prepares them, without changing
+   Wine's source:
+   - Each system call stub loads the dispatcher's address PC-relatively
+     (`adrp`/`ldr`, as Wine's ARM64EC stub does), its literal becomes zeros and
+     its relocation entry is cleared. The pull request's `read_pe` refuses the
+     original `ntdll.dll` ("Native text relocations ... need an offline code
+     rewrite") and accepts the rewritten one.
+   - Each instruction that uses x18 becomes a branch to a trampoline that saves
+     two free registers on the stack (plain ARM64 keeps SP 16-byte aligned),
+     reads the TEB from the TSD slot the way the loader's `ios_jit_patch_x18`
+     does (`TPIDRRO_EL0 & ~7`, plus the slot's offset), runs the instruction
+     with that register in place of x18, restores the two and branches back.
+     The offset is read from a data slot the loader fills, the one the pull
+     request uses (offset 4 of `madeira_pe_thread_state`), not built into the
+     code. That covers all 758 sites, including ntdll's x18 store in the
+     routine that captures a context, which `ios_jit_patch_x18` leaves alone.
+     It refuses what it cannot rewrite (an instruction that writes x18, or
+     uses SP beside it); none of the four modules has one.
+   - In the pull request's `prepare.py`, plain ARM64 needs these lines where
+     it now refuses anything but ARM64EC (in `thread_state.rewrite`, or before
+     calling it), after `rewrite.py IN OUT` has done the stubs on the file:
+     ```python
+     if machine == 0xaa64:
+         trampolines, teb_sites = rewrite_image(image, PE_OFFSET, tramp_start, slot)
+         return bytearray(trampolines), teb_sites, 0
+     ```
+     With that, `prepare.py` builds the Mach-O framework of each of the four
+     modules (tried on Linux, code signing left out): the PE's code in
+     `__TEXT`, its 758 trampolines in `__THREAD`, every branch reaching its
+     trampoline, every trampoline reading the slot and branching back.
+
+   What was not tried: running them. That needs an iPhone, the pull
+   request's loader (`signed_pe_ios.c`) used for these four modules, and the
+   loader writing the TSD offset to the slot. As with the load-time patcher,
+   the trampolines have no unwind data. That matters only if an instruction in
+   one faults: they read or write the TEB, except ntdll's store of the TEB into
+   a context its caller passed.
    - A signed library has one copy of its data, and every Windows process in
      Madeira is a pseudo-process in the same iOS process: two processes that
      load `ntdll.dll` need two copies, and the pull request's loader refuses a
@@ -295,6 +327,29 @@ runner) does what the host it runs on allows:
   ARM64.
 - **With mingw-w64 GCC, or clang with lld:** builds the WoW64 CPU module and
   checks what it imports and exports.
+
+`python3 tests/host/check-arm64-teb-rewrite.py` (not in CI: it needs LLVM's
+`llvm-mc`) checks `build/signed-arm64/rewrite.py` (step 4) on the four modules
+in `app/Madeira/aarch64-windows`, with llvm-mc as the decoder rather than the
+rewriter's own:
+- every instruction that uses x18 or w18, outside literal data, is a branch to
+  a trampoline, and nothing else is; each trampoline is the expected sequence,
+  with the original instruction renamed to a register it does not use, and
+  branches back to the next instruction;
+- each system call stub loads the same address PC-relatively, no relocation is
+  left in code, and nothing outside the code changed but cleared relocation
+  entries;
+- done as a wrapper would (the stubs on the file, then `rewrite_image` on the
+  image mapped elsewhere), the code and trampolines are the same;
+- with `qemu-aarch64` and an `aarch64-linux-gnu` toolchain, every distinct x18
+  instruction in the modules (133) and about 4,700 random encodings of every
+  form the rewriter knows run as the original (x18 = a TEB) and as rewritten
+  (x18 garbage, the TEB found through `TPIDR_EL0`, which Linux lets a program
+  set, and the slot), from the same registers, flags and memory
+  (`tests/x64-interp/teb-runner.c`): registers, flags and memory match after,
+  and x18 is untouched. Deliberate bugs (no `& ~7`, a scratch register the
+  instruction uses, a register not restored, a missed register field or
+  instruction class, a stub's offset, CMP refused) were each caught.
 
 `python3 tests/host/check-wow64interp-wine.py WINE_BUILD_DIR` (not in CI:
 it needs a Wine built for x86-64 Linux with `--enable-archs=i386,x86_64`,
