@@ -51,7 +51,8 @@ for op in ['add', 'or', 'adc', 'sbb', 'and', 'sub', 'xor', 'cmp']:
 for producer, u in [('cmp eax, ebx', 0), ('sub rcx, rdx', 0), ('add esi, edi', 0), ('cmp al, bl', 0), ('cmp r8w, r9w', 0),
                     ('and eax, ebx', AF), ('test rcx, rdx', AF), ('xor sil, dil', AF), ('or ax, bx', AF), ('inc eax', 0),
                     ('dec cl', 0), ('neg ebx', 0), ('cmp eax, dword ptr [rsi+8]', 0), ('sbb ecx, edx', 0),
-                    ('adc rax, rbx', 0), ('sbb dl, 0x80', 0)]:
+                    ('adc rax, rbx', 0), ('sbb dl, 0x80', 0),
+                    ('shl eax, 1', AF), ('shr rbx, 1', AF), ('sar ecx, 1', AF)]:
     for cc in ['o', 'no', 'b', 'ae', 'e', 'ne', 'be', 'a', 's', 'ns', 'p', 'np', 'l', 'ge', 'le', 'g']:
         t(f'{producer}; set{cc} r10b', u)
     t(f'{producer}; cmovle r11, r12; cmovb r13, r14; cmovo r15, rbx', u)
@@ -62,9 +63,24 @@ for producer, u in [('cmp eax, ebx', 0), ('sub rcx, rdx', 0), ('add esi, edi', 0
     t(f'{producer}; shl r10d, 3', u | AF | OF)
     t(f'{producer}; shr r11, cl', u | AF | OF, RCX_SMALL)
     t(f'{producer}; rcl r12w, 1', u)
+# Shifts by more than 1 leave OF undefined: read the other flags after them.
+for producer in ['shl rdx, 33', 'shr esi, 31', 'sar r9, 63', 'shl r8d, 7']:
+    t(f'{producer}; adc r10, r11; setc r12b; sete r13b; sets r14b; setp r15b; seta bl; inc rcx; setc bh', AF | OF)
+# The register forms of ADD r64, r/m64 and the like (48 03 C3 is ADD RAX, RBX), which compilers such as MSVC
+# emit and assemblers do not.
+for code, u in [('0x48, 0x03, 0xc3', 0), ('0x4c, 0x2b, 0xc1', 0), ('0x49, 0x3b, 0xc1', 0), ('0x4d, 0x23, 0xd3', AF),
+                ('0x0b, 0xd8', AF), ('0x45, 0x33, 0xc9', AF), ('0x48, 0x13, 0xc3', 0), ('0x03, 0xc3', 0),
+                ('0x49, 0x8b, 0xc0', 0), ('0x44, 0x8b, 0xc3', 0), ('0x8b, 0xc3', 0)]:
+    t(f'.byte {code}', u)
 # Self-modifying code: each pass changes the immediate the next one runs (restored at the end).
 t('lea rdx, [rip + 2f]; mov ecx, 3; 2: mov eax, 0x11111111; add ebx, eax; inc byte ptr [rdx+1]; dec ecx; jnz 2b; sub byte ptr [rdx+1], 3')
 t('lea rdx, [rip + 2f]; mov byte ptr [rdx], 0x90; 2: int3; mov byte ptr [rdx], 0xcc')   # written before it first runs
+# ...and an instruction a few after the store, which the interpreter has already decoded with it (each store
+# form the decoded-instruction cache has: a 32- and a 64-bit store, a read-modify-write, an SSE store).
+t('lea rdx, [rip + 3f]; mov eax, 0x22222222; mov dword ptr [rdx+1], eax; 3: mov ecx, 0x11111111; add ebx, ecx; mov dword ptr [rdx+1], 0x11111111')
+t('lea rdx, [rip + 3f]; mov rax, 0x3333333344444444; mov qword ptr [rdx+2], rax; 3: mov rcx, 0x1111111122222222; add rbx, rcx; mov rax, 0x1111111122222222; mov qword ptr [rdx+2], rax')
+t('lea rdx, [rip + 3f]; add dword ptr [rdx+1], 0x11111111; 3: mov ecx, 0x11111111; add ebx, ecx; sub dword ptr [rdx+1], 0x11111111')
+t('lea rdx, [rip + 3f]; mov eax, 0x22222222; movd xmm0, eax; movd dword ptr [rdx+1], xmm0; 3: mov ecx, 0x11111111; add ebx, ecx; mov dword ptr [rdx+1], 0x11111111')
 t('mov ecx, 5; 1: add eax, ecx; dec ecx; jnz 1b')
 t('xor eax, eax; 1: add eax, 3; cmp eax, 30; jl 1b; sete bl')
 for op in ['inc', 'dec', 'neg', 'not']:

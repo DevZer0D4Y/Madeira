@@ -165,20 +165,29 @@ x87 program with C casts through `FLDCW`/`FISTP` and 64-bit integers through
 carries it out in C. Nothing is generated: there is no executable memory at
 all. All state is in one `X64State` per thread.
 
-Each thread can have a **decoded-instruction cache** (`X64Env.cache`, 512 KB):
-an instruction is decoded once, and the common forms (moves, `LEA`, the ALU
-operations, `TEST`, `INC`/`DEC`, `PUSH`/`POP`, jumps, calls and returns,
-`MOVZX`/`MOVSX`, `SETcc`, `CMOVcc`, `IMUL`, `MUL`/`DIV`, shifts and double
-shifts, `CDQ`) run from the decoded form, and x87, SSE and MMX instructions run
-from it through the same code the decoder uses for them; the rest (string
-instructions, `LOCK`, system instructions...) run through the decoder as
-before. Each time a cached instruction runs, its bytes are compared with the
-ones it was decoded from, and it is decoded again if they changed, so
-self-modifying code and code a game's own JIT writes (Mono, .NET, LuaJIT)
-need nothing special. Arithmetic flags are worked out lazily: `ADD`, `SUB`,
-`CMP`, `ADC`, `SBB`, the logic operations, `INC` and `DEC` leave their operands,
-and the flags are computed only when something reads them (a `CMP` followed by
-a conditional jump reads just the condition).
+Each thread can have a **decoded-instruction cache** (`X64Env.cache`, 512 KB)
+of **blocks**: straight runs of up to 14 decoded instructions, at most 48 bytes
+of one page, ending after a jump, call or return. The common forms (moves,
+`LEA`, the ALU operations, `TEST`, `INC`/`DEC`, `PUSH`/`POP`, jumps, calls and
+returns, `MOVZX`/`MOVSX`, `SETcc`, `CMOVcc`, `IMUL`, `MUL`/`DIV`, shifts and
+double shifts, `CDQ`) run from the decoded form, and x87, SSE and MMX
+instructions run from it through the same code the decoder uses for them; a
+block ends before anything else (string instructions, `LOCK`, system
+instructions...), which runs through the decoder as before. The most common
+of all (32- and 64-bit register `MOV`, `ADD`, `SUB`, `CMP`, `AND`, `OR`, `XOR`,
+`TEST`, shifts by a constant, and loads and stores) are decoded into forms of
+their own, and the loop that runs blocks is built once for 32-bit and once for
+64-bit code, so it does not test the mode each time. Each time a block starts,
+its bytes are compared with the ones it was decoded from, and it is decoded
+again if they changed; an instruction that stores within 128 bytes of its own
+block's code ends the block there, so it is compared again before the rest
+runs. Self-modifying code and code a game's own JIT writes (Mono, .NET, LuaJIT)
+need nothing special. Each address has two places in the cache, so two blocks
+that run in turn do not keep replacing each other. Arithmetic flags are worked
+out lazily: `ADD`, `SUB`, `CMP`, `ADC`, `SBB`, the logic operations, `INC`,
+`DEC` and `SHL`/`SHR`/`SAR` leave their operands, and the flags are computed only
+when something reads them (a `CMP` followed by a conditional jump reads just the
+condition).
 
 - **64-bit mode**: guest addresses are host addresses, as under FEX in Wine's
   ARM64EC process.
@@ -247,9 +256,14 @@ runtime, and reads time through `NtQueryPerformanceCounter` in a Windows build.
 That is what lets it run inside a WoW64 CPU module.
 
 Interpreting is much slower than running translated code. On the x86-64 Linux
-machine used for development (an Intel Xeon at 2.3 GHz) the engine check runs
-about 90 million x86 instructions a second with the cache (40 without); the
-engine check reports both rates on the device. It will still be much slower
+machine used for development (an Intel Xeon at 2.3 GHz, shared, so timings vary
+by a third from run to run) the engine check runs about 110 to 150 million x86
+instructions a second with the cache (35 without); the engine check reports both
+rates on the device. Blocks halved the work: the cached path went from about
+170 host instructions per x86 instruction (one cached instruction at a time) to
+about 75 (counted with callgrind, which does not vary), and from about 85 to 130
+million a second on the same machine, run after run. Under QEMU on ARM64 the
+engine check went from 9.4 to 14 million a second. It will still be much slower
 than JIT, so No JIT suits older, lighter games.
 
 ## The WoW64 CPU module
@@ -289,6 +303,10 @@ and exports the `BTCpu` entry points `wow64.dll` looks up, as Wine's
 - On ARM64 it reads the TEB (x18) with one `MOV`: Madeira's loader rewrites x18
   reads on iOS, where x18 is not the TEB, in a few instruction forms only, and
   `check-x64-interpreter.py` fails if the module has any other.
+- It is built for the A12 (`-mcpu=apple-a12`), the oldest chip iOS 17 runs on: the
+  guest's loads are `LDAPR` (ARMv8.3), which keeps x86's memory order without
+  `LDAR`'s wait for earlier stores (x86 lets a load pass an earlier store too), and
+  `LOCK`ed instructions use ARMv8.1 atomics.
 - Its messages go to Wine's debug output (`__wine_dbg_output`), which Madeira's
   log shows whatever `WINEDEBUG` says.
 - On an x86-64 host, Wine keeps a 32-bit thread's x87, MMX and SSE registers
@@ -312,12 +330,12 @@ runner) does what the host it runs on allows:
 - **x86-64 Linux:** runs the committed programs natively (the 32-bit ones in a
   32-bit process with Windows' x87 control word) to confirm the expected
   results, then two instruction fuzzers. `gen-fuzz-insns.py` writes about
-  1,800 64-bit snippets (every instruction form above, in each operand size,
+  1,900 64-bit snippets (every instruction form above, in each operand size,
   with register, memory, `LOCK` and segment forms, branches taken and not);
   `fuzz.c` runs each natively and through the interpreter, at the same
   address, from the same random registers, flags, XMM registers, MXCSR
   (rounding, DAZ, FTZ) and memory, and compares every register, the defined
-  flags, MXCSR and both memory regions. `gen-fuzz-insns32.py` writes about 1,250
+  flags, MXCSR and both memory regions. `gen-fuzz-insns32.py` writes about 1,350
   32-bit snippets (integer code as old compilers emit it, x87, MMX); `fuzz32.c`
   runs them natively in a 32-bit process from random x87, MMX and SSE state
   (`FXRSTOR`), and `fuzz replay` compares the interpreter's registers, flags,
@@ -362,8 +380,9 @@ the registers its handler sees, and runs threads with atomics, x87 math through
 msvcrt, 64-bit division, files and sockets (system and unix calls);
 `workloads-main.c` runs the engine check's 32-bit programs. Every line is the
 same, except that msvcrt's transcendental results are compared to 1e-13. A
-simple loop there runs about 30 times slower interpreted than on the
-processor: about 95 million instructions a second. The module gives each
+simple loop there runs about 15 times slower interpreted than on the
+processor: about 190 million instructions a second (twice what it ran before
+the cache held blocks). The module gives each
 thread its own cache and frees it when the thread ends.
 
 During development the 64-bit fuzzer ran 3.3 million comparisons over four
@@ -387,6 +406,21 @@ instructions), and two modify their own code as they run. Deliberate bugs in
 the cache and the lazy flags (a signed condition, `INC` keeping `CF`, a byte
 register, `MOVSX`, a segment base, the bytes check, a shift reading stale flags,
 `ADC`'s and `SBB`'s carry in and out...) were each caught.
+
+For the blocks: snippets store into an instruction a few after the store in their
+own block, which the interpreter has already decoded, with each kind of store (32-
+and 64-bit, read-modify-write, SSE, x87); others use the register forms that
+compilers such as MSVC emit and assemblers do not (`03 C3`, `ADD EAX, EBX`); shifts by
+a constant are followed by each flag reader; and every third run goes in pieces of
+one to five instructions (`X64_EXIT_BUDGET` between them), each of which must run
+exactly its budget, so blocks stop and resume part of the way through. Deliberate
+bugs (no store check, either kind; a lazy shift flag; the shift's carry into `ADC`;
+the `03 C3` operands; `SAR` as a logical shift; a block moved to its second place
+without its instructions; the bytes check missing the last bytes; the stop address
+or the budget inside a block; a 32-bit load not clearing the upper half) were each
+caught: the second place by the engine check, whose programs are big enough to
+need it, the rest by the fuzzers. Before these snippets were added, four of them
+were not.
 
 `tests/x64-interp/gen-selfcheck.py` rebuilds the programs and
 `app/Madeira/NoJITSelfCheckData.h` (it runs them natively, so it needs x86-64

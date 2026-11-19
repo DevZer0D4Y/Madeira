@@ -31,6 +31,7 @@
 #include "X64Interpreter.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <string.h>
 #include <time.h>
 #if !defined(__x86_64__) && !defined(__i386__) && !defined(__aarch64__)
@@ -3366,7 +3367,7 @@ void x64_fxrstor(X64State *s, const void *area)
 // overwritten before anything reads them. flags_flush works them out, and
 // lazy_cond answers a condition after a CMP or TEST without it.
 
-enum { LF_NONE, LF_ADD, LF_SUB, LF_LOGIC, LF_INC, LF_DEC, LF_ADC, LF_SBB };
+enum { LF_NONE, LF_ADD, LF_SUB, LF_LOGIC, LF_INC, LF_DEC, LF_ADC, LF_SBB, LF_SHL, LF_SHR, LF_SAR };   // shifts: b is the count, 1 to bits - 1
 
 static inline void lazy(X64State *s, int op, int size, uint64_t a, uint64_t b, uint64_t r)
 {
@@ -3396,6 +3397,16 @@ static void flags_flush(X64State *s)
         f = (a < b || (s->lazy_carry && a == b) ? FL_CF : 0) | (((a ^ b) & (a ^ r) & sign) ? FL_OF : 0)
           | (((a ^ b ^ r) & 0x10) ? FL_AF : 0);
         break;
+    case LF_SHL:   // as shift() sets them; AF clear
+        f = (a >> (8 * s->lazy_size - b)) & 1 ? FL_CF : 0;
+        if (((r & sign) != 0) != (f != 0)) f |= FL_OF;
+        break;
+    case LF_SHR:
+        f = ((a >> (b - 1)) & 1 ? FL_CF : 0) | (a & sign ? FL_OF : 0);
+        break;
+    case LF_SAR:
+        f = (a >> (b - 1)) & 1 ? FL_CF : 0;
+        break;
     default:   // LF_LOGIC: CF, OF and AF clear
         f = 0;
         break;
@@ -3420,11 +3431,13 @@ static inline uint64_t lazy_cf(const X64State *s)
     case LF_ADC: return s->lazy_r < s->lazy_a || (s->lazy_carry && s->lazy_r == s->lazy_a) ? FL_CF : 0;
     case LF_SBB: return s->lazy_a < s->lazy_b || (s->lazy_carry && s->lazy_a == s->lazy_b) ? FL_CF : 0;
     case LF_LOGIC: return 0;
+    case LF_SHL: return (s->lazy_a >> (8 * s->lazy_size - s->lazy_b)) & 1 ? FL_CF : 0;
+    case LF_SHR: case LF_SAR: return (s->lazy_a >> (s->lazy_b - 1)) & 1 ? FL_CF : 0;
     default: return s->rflags & FL_CF;
     }
 }
 
-static inline bool lazy_cond(X64State *s, int cc)
+static inline __attribute__((always_inline)) bool lazy_cond(X64State *s, int cc)
 {
     uint64_t a = s->lazy_a, b = s->lazy_b, r = s->lazy_r, sign = sign_of(s->lazy_size);
     bool v;
@@ -3457,13 +3470,18 @@ static inline bool lazy_cond(X64State *s, int cc)
 // ---------------------------------------------------------------------------
 // The decoded-instruction cache (X64Env.cache)
 //
-// One 64-byte entry per instruction, direct-mapped by address. An entry for one
-// of the common forms below holds it decoded; any other instruction's entry says
-// so, and step() decodes and runs it as before. Before an entry runs, the
-// instruction's bytes are compared with the ones it was decoded from.
+// Blocks of decoded instructions, found by the address of the first. A
+// block runs straight through: up to FB_OPS instructions of the common forms
+// below, in at most FB_BYTES bytes of one page, ending after a jump, call or
+// return, or before an instruction it does not hold, which step() decodes and
+// runs as before. Before a block runs, its bytes are compared with the ones it was
+// decoded from (a block that starts with such an instruction holds no
+// instructions, only the bytes that decided it). An instruction that stores
+// within 128 bytes of its block's code ends the block, so code that changes
+// itself is compared again before it runs.
 
 enum {
-    FX_EMPTY, FX_SLOW,
+    FX_SLOW,                                 // step() runs it
     FX_ALU_RM_R, FX_ALU_R_RM, FX_ALU_RM_I,   // aux: the ALU operation
     FX_TEST_RM_R, FX_TEST_RM_I,
     FX_MOV_RM_R, FX_MOV_R_RM, FX_MOV_RM_I, FX_LEA,
@@ -3481,55 +3499,92 @@ enum {
     // Decoded here, run by the x87, SSE and MMX code step() uses (aux: the opcode; size:
     // the prefixes, 1 for 66, 2 for F3, 4 for F2; imm: the 8-bit immediate).
     FX_X87, FX_SSE,
+    // The most common forms, made from the ones above when a block is built
+    // (fx_special): 32- and 64-bit, with rm the destination register and reg or imm
+    // the source, except LOAD (reg from ea) and STORE (reg to ea).
+    FX_ADD_RR32, FX_ADD_RR64, FX_ADD_RI32, FX_ADD_RI64,
+    FX_SUB_RR32, FX_SUB_RR64, FX_SUB_RI32, FX_SUB_RI64,
+    FX_CMP_RR32, FX_CMP_RR64, FX_CMP_RI32, FX_CMP_RI64,
+    FX_AND_RR32, FX_AND_RR64, FX_AND_RI32, FX_AND_RI64,
+    FX_OR_RR32, FX_OR_RR64, FX_OR_RI32, FX_OR_RI64,
+    FX_XOR_RR32, FX_XOR_RR64, FX_XOR_RI32, FX_XOR_RI64,
+    FX_TEST_RR32, FX_TEST_RR64, FX_TEST_RI32, FX_TEST_RI64,
+    FX_MOV_RR32, FX_MOV_RR64, FX_MOV_RI32, FX_MOV_RI64,
+    FX_LOAD32, FX_LOAD64, FX_STORE32, FX_STORE64,
+    FX_SHL_RI32, FX_SHL_RI64, FX_SHR_RI32, FX_SHR_RI64, FX_SAR_RI32, FX_SAR_RI64,   // imm: the count, not 0
 };
 
 #define FX_NONE 0xff     // no base or index register
 #define FX_RIPREL 0xfe   // base: RIP
 
-typedef struct FastEntry {
-    uint64_t tag;          // guest address, bit 63 set for 32-bit mode
-    uint64_t w0, w1;       // the instruction's bytes, and which of them count
-    uint64_t m0, m1;
+typedef struct FastOp {
     uint64_t imm;
     int32_t disp;
     uint8_t len, kind, size, aux;
     uint8_t reg, rm;       // ModRM.reg; the register operand (when not memory)
     uint8_t base, index, scale, seg, rex;
     uint8_t mem;
-} FastEntry;
+    uint8_t check;         // FB_CHECK_*: what it may store to, which might be its block's code
+    uint8_t pad[7];
+} FastOp;
 
-_Static_assert(sizeof(FastEntry) <= 64, "a cache entry is 64 bytes");
+enum { FB_CHECK_NONE, FB_CHECK_EA, FB_CHECK_STACK };
 
-static inline uint64_t fx_tag(const X64State *s, uint64_t rip)
+#define FB_BYTES 48
+#define FB_OPS 14
+
+typedef struct FastBlock {
+    uint64_t tag;          // guest address, bit 63 set for 32-bit mode
+    uint8_t nbytes, nops;  // nbytes: the bytes decoded (all of them decided something)
+    uint8_t pad[6];
+    uint8_t code[FB_BYTES];
+    FastOp ops[FB_OPS];
+} FastBlock;
+
+_Static_assert(sizeof(FastOp) == 32, "a decoded instruction is 32 bytes");
+_Static_assert(sizeof(FastBlock) == X64_CACHE_BLOCK_SIZE, "a block is X64_CACHE_BLOCK_SIZE bytes");
+
+static inline uint64_t fx_tag(uint64_t rip, bool m32)
 {
-    return s->mode32 ? rip | 0x8000000000000000ull : rip;
+    return m32 ? rip | 0x8000000000000000ull : rip;
 }
 
-static inline FastEntry *fx_entry(void *cache, uint64_t rip)
+// Two ways for each address: a new block goes in the first, and the block there
+// moves to the second, so two blocks that run in turn both stay.
+static inline FastBlock *fb_lookup(void *cache, uint64_t rip, bool m32)
 {
-    return (FastEntry *)cache + ((rip ^ (rip >> 13)) & (X64_CACHE_ENTRIES - 1));
+    FastBlock *b = (FastBlock *)cache + 2 * (((uint32_t)rip * 2654435761u) >> (32 - (X64_CACHE_BLOCKS_LOG2 - 1)));
+    uint64_t tag = fx_tag(rip, m32);
+    if (b->tag == tag) return b;
+    if (b[1].tag == tag) return b + 1;
+    memcpy(b + 1, b, offsetof(FastBlock, ops) + b->nops * sizeof(FastOp));
+    b->tag = tag;
+    b->nbytes = 0;   // to be built
+    return b;
 }
 
 static inline uint64_t load64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
-// Whether the bytes at p are still the entry's.
-static inline bool fx_same(const FastEntry *e, const uint8_t *p)
+// Whether the bytes at p are still the block's.
+static inline bool fb_same(const FastBlock *b, const uint8_t *p)
 {
-    if (((uintptr_t)p & 4095) <= 4096 - 16) {  // both words on one page: no fault past its end
-        if (!e->m1) return !((load64(p) ^ e->w0) & e->m0);
-        return !(((load64(p) ^ e->w0) & e->m0) | ((load64(p + 8) ^ e->w1) & e->m1));
+    unsigned n = b->nbytes;
+    if (!n) return false;   // empty
+    if (((uintptr_t)p & 4095) + ((n + 7) & ~7u) <= 4096) {   // every word on the page: no fault past its end
+        uint64_t diff = 0;
+        unsigned i = 0;
+        for (; i + 8 <= n; i += 8) diff |= load64(p + i) ^ load64(b->code + i);
+        if (i < n) diff |= (load64(p + i) ^ load64(b->code + i)) & ((1ull << (8 * (n - i))) - 1);
+        return !diff;
     }
-    uint8_t bytes[16];
-    memcpy(bytes, &e->w0, 8);
-    memcpy(bytes + 8, &e->w1, 8);
-    return !memcmp(bytes, p, e->len);
+    return !memcmp(b->code, p, n);
 }
 
 static inline uint32_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static inline uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
 // ModRM, SIB and displacement into the entry; returns what follows them.
-static const uint8_t *fx_modrm(FastEntry *e, const uint8_t *p, bool m32, uint8_t rex, int *regf)
+static const uint8_t *fx_modrm(FastOp *e, const uint8_t *p, bool m32, uint8_t rex, int *regf)
 {
     uint8_t m = *p++;
     int mod = m >> 6, rmf = m & 7;
@@ -3563,7 +3618,7 @@ static const uint8_t *fx_modrm(FastEntry *e, const uint8_t *p, bool m32, uint8_t
 }
 
 // An immediate of the operand size: 8 or 16 bits as they are, 32 sign-extended.
-static inline const uint8_t *fx_imm(FastEntry *e, const uint8_t *p, int size)
+static inline const uint8_t *fx_imm(FastOp *e, const uint8_t *p, int size)
 {
     if (size == 1) { e->imm = *p; return p + 1; }
     if (size == 2) { e->imm = rd16(p); return p + 2; }
@@ -3572,16 +3627,14 @@ static inline const uint8_t *fx_imm(FastEntry *e, const uint8_t *p, int size)
 }
 
 // Decodes the instruction at p (guest address rip) into e: one of the forms
-// below, or FX_SLOW. Either way the entry keeps the bytes the decision was made
-// from (for FX_SLOW, the ones read before it), and is decoded again when they
-// change.
-static void fx_decode(const X64State *s, FastEntry *e, uint64_t rip, const uint8_t *p0)
+// below, or FX_SLOW. Returns how many bytes the decision was made from (for
+// FX_SLOW, the ones read before it).
+static unsigned fx_decode(FastOp *e, uint64_t rip, const uint8_t *p0, bool m32)
 {
     const uint8_t *p = p0;
-    bool m32 = s->mode32, opsize = false;
+    bool opsize = false;
     uint8_t rex = 0, op, rep = 0;
     int seg = 0, regf = 0, size = 4;
-    e->tag = fx_tag(s, rip);
     e->kind = FX_SLOW;
     e->mem = 0;
     e->base = e->index = FX_NONE;
@@ -3736,22 +3789,113 @@ done:;
     if (len > 15) { kind = FX_SLOW; len = 15; }   // step() reports it; 15 bytes decided that
     if (rep && kind != FX_SSE) kind = FX_SLOW;     // REP strings, PAUSE, POPCNT...
     if (kind == FX_X87 || kind == FX_SSE) size = (opsize ? 1 : 0) | (rep == 0xF3 ? 2 : rep == 0xF2 ? 4 : 0);
-    if (kind == FX_JCC || kind == FX_JMP || kind == FX_CALL)   // the target, as EIP or RIP holds it
-        e->imm = ipm(s, rip + len + e->imm);
+    if (kind == FX_JCC || kind == FX_JMP || kind == FX_CALL) {   // the target, as EIP or RIP holds it
+        e->imm = rip + len + e->imm;
+        if (m32) e->imm = (uint32_t)e->imm;
+    }
     e->len = (uint8_t)len;
     e->size = (uint8_t)size;
     e->seg = (uint8_t)seg;
     e->rex = rex;
-    uint8_t bytes[16] = { 0 };
-    memcpy(bytes, p0, len);
-    memcpy(&e->w0, bytes, 8);
-    memcpy(&e->w1, bytes + 8, 8);
-    e->m0 = len >= 8 ? ~0ull : (1ull << (8 * len)) - 1;
-    e->m1 = len <= 8 ? 0 : (1ull << (8 * (len - 8))) - 1;
     e->kind = (uint8_t)kind;
+    // What it may store to. CALL and CALL_RM end their block, so need no check.
+    e->check = FB_CHECK_NONE;
+    switch (kind) {
+    case FX_ALU_RM_R: case FX_ALU_RM_I:
+        if (e->mem && e->aux != ALU_CMP) e->check = FB_CHECK_EA;
+        break;
+    case FX_MOV_RM_R: case FX_MOV_RM_I: case FX_INC: case FX_DEC: case FX_SETCC: case FX_SHIFT: case FX_SHIFTD:
+    case FX_GROUP3: case FX_X87: case FX_SSE:
+        if (e->mem) e->check = FB_CHECK_EA;
+        break;
+    case FX_PUSH_R: case FX_PUSH_I: case FX_PUSH_RM:
+        e->check = FB_CHECK_STACK;
+        break;
+    }
+    return (unsigned)len;
 }
 
-static inline uint64_t fx_getr(const X64State *s, const FastEntry *e, int reg, int size)
+// Whether an instruction of this kind ends its block.
+static inline bool fx_ends_block(int kind)
+{
+    return kind == FX_JCC || kind == FX_JMP || kind == FX_CALL || kind == FX_RET || kind == FX_JMP_RM || kind == FX_CALL_RM;
+}
+
+// One of the common forms above, for an instruction fx_decode decoded.
+static void fx_special(FastOp *e)
+{
+    static const uint8_t alu_kind[8] = {   // by ALU operation: its RR32 kind, or 0
+        [ALU_ADD] = FX_ADD_RR32, [ALU_SUB] = FX_SUB_RR32, [ALU_CMP] = FX_CMP_RR32,
+        [ALU_AND] = FX_AND_RR32, [ALU_OR] = FX_OR_RR32, [ALU_XOR] = FX_XOR_RR32,
+    };
+    if (e->size != 4 && e->size != 8) return;
+    int k;
+    uint8_t t;
+    switch (e->kind) {
+    case FX_ALU_R_RM:
+        if (e->mem || !alu_kind[e->aux]) return;
+        t = e->reg; e->reg = e->rm; e->rm = t;   // the destination is reg
+        k = alu_kind[e->aux];
+        break;
+    case FX_ALU_RM_R:
+        if (e->mem || !alu_kind[e->aux]) return;
+        k = alu_kind[e->aux];
+        break;
+    case FX_ALU_RM_I:
+        if (e->mem || !alu_kind[e->aux]) return;
+        k = alu_kind[e->aux] + 2;
+        break;
+    case FX_TEST_RM_R: if (e->mem) return; k = FX_TEST_RR32; break;
+    case FX_TEST_RM_I: if (e->mem) return; k = FX_TEST_RI32; break;
+    case FX_MOV_RM_R: k = e->mem ? FX_STORE32 : FX_MOV_RR32; break;
+    case FX_MOV_R_RM:
+        if (e->mem) { k = FX_LOAD32; break; }
+        t = e->reg; e->reg = e->rm; e->rm = t;
+        k = FX_MOV_RR32;
+        break;
+    case FX_MOV_RM_I: if (e->mem) return; k = FX_MOV_RI32; break;
+    case FX_SHIFT:
+        if (e->mem || e->imm == 256 || e->aux < 4) return;
+        e->imm &= e->size == 8 ? 63 : 31;
+        if (!e->imm) return;   // no flags change, but a 32-bit register is still written
+        k = e->aux == 5 ? FX_SHR_RI32 : e->aux == 7 ? FX_SAR_RI32 : FX_SHL_RI32;
+        break;
+    default: return;
+    }
+    e->kind = (uint8_t)(k + (e->size == 8));
+}
+
+// Decodes the block that starts at guest address rip (host address code).
+static void fb_build(FastBlock *b, uint64_t rip, const uint8_t *code, bool m32)
+{
+    unsigned n = 0, bytes = 0;
+    b->tag = fx_tag(rip, m32);
+    b->nops = 0;
+    for (;;) {
+        FastOp *e = &b->ops[n];
+        const uint8_t *p = code + bytes;
+        // After the first, an instruction that might reach the next page starts a block of its own.
+        if (n && ((uintptr_t)p & 4095) > 4096 - 15) break;
+        unsigned len = fx_decode(e, rip + bytes, p, m32);
+        if (e->kind == FX_SLOW) {
+            if (!n) {   // no instruction: the bytes that decided it, for step()
+                memcpy(b->code, code, len);
+                bytes = len;
+            }
+            break;
+        }
+        if (bytes + len > FB_BYTES) break;
+        memcpy(b->code + bytes, p, len);
+        fx_special(e);
+        bytes += len;
+        n++;
+        if (fx_ends_block(e->kind) || n == FB_OPS) break;
+    }
+    b->nops = (uint8_t)n;
+    b->nbytes = (uint8_t)bytes;
+}
+
+static inline uint64_t fx_getr(const X64State *s, const FastOp *e, int reg, int size)
 {
     if (size == 1) {
         if (!e->rex && reg >= 4 && reg < 8) return (s->gpr[reg - 4] >> 8) & 0xff;
@@ -3760,7 +3904,7 @@ static inline uint64_t fx_getr(const X64State *s, const FastEntry *e, int reg, i
     return s->gpr[reg] & mask_of(size);
 }
 
-static inline void fx_setr(X64State *s, const FastEntry *e, int reg, int size, uint64_t v)
+static inline void fx_setr(X64State *s, const FastOp *e, int reg, int size, uint64_t v)
 {
     switch (size) {
     case 1:
@@ -3774,34 +3918,53 @@ static inline void fx_setr(X64State *s, const FastEntry *e, int reg, int size, u
 }
 
 // The memory operand's offset (LEA's result), and its host address.
-static inline uint64_t fx_offset(const X64State *s, const FastEntry *e, uint64_t next)
+static inline uint64_t fx_offset(const X64State *s, const FastOp *e, uint64_t next, bool m32)
 {
     uint64_t off = (uint64_t)(int64_t)e->disp;
     if (e->base == FX_RIPREL) off += next;
     else if (e->base != FX_NONE) off += s->gpr[e->base];
     if (e->index != FX_NONE) off += s->gpr[e->index] << e->scale;
-    return s->mode32 ? (uint32_t)off : off;
+    return m32 ? (uint32_t)off : off;
 }
 
-static inline uint64_t fx_ea(const X64State *s, const FastEntry *e, uint64_t next)
+static inline uint64_t fx_ea(const X64State *s, const FastOp *e, uint64_t next, bool m32)
 {
-    uint64_t a = fx_offset(s, e, next) + (e->seg == 4 ? s->fs_base : e->seg == 5 ? s->gs_base : 0);
-    return s->mode32 ? s->guest_base + (uint32_t)a : a;
+    uint64_t a = fx_offset(s, e, next, m32);
+    if (e->seg) a += e->seg == 4 ? s->fs_base : s->gs_base;
+    return m32 ? s->guest_base + (uint32_t)a : a;
 }
 
-static inline uint64_t fx_get(const X64State *s, const FastEntry *e, uint64_t ea, int size)
+// PUSH and POP for the cache, the mode known.
+static inline void fx_push(X64State *s, uint64_t v, int size, bool m32)
+{
+    uint64_t sp = s->gpr[X64_RSP] - (uint64_t)size;
+    if (m32) sp = (uint32_t)sp;
+    mem_write(m32 ? s->guest_base + sp : sp, size, v);
+    s->gpr[X64_RSP] = sp;
+}
+
+static inline uint64_t fx_pop(X64State *s, int size, bool m32)
+{
+    uint64_t sp = s->gpr[X64_RSP];
+    uint64_t v = mem_read(m32 ? s->guest_base + sp : sp, size);
+    sp += (uint64_t)size;
+    s->gpr[X64_RSP] = m32 ? (uint32_t)sp : sp;
+    return v;
+}
+
+static inline uint64_t fx_get(const X64State *s, const FastOp *e, uint64_t ea, int size)
 {
     return e->mem ? mem_read(ea, size) : fx_getr(s, e, e->rm, size);
 }
 
-static inline void fx_set(X64State *s, const FastEntry *e, uint64_t ea, int size, uint64_t v)
+static inline void fx_set(X64State *s, const FastOp *e, uint64_t ea, int size, uint64_t v)
 {
     if (e->mem) mem_write(ea, size, v);
     else fx_setr(s, e, e->rm, size, v);
 }
 
 // An ALU operation, its flags left lazy (ADC and SBB work them out).
-static inline uint64_t fx_alu(X64State *s, int op, uint64_t a, uint64_t b, int size)
+static inline __attribute__((always_inline)) uint64_t fx_alu(X64State *s, int op, uint64_t a, uint64_t b, int size)
 {
     uint64_t m = mask_of(size), r;
     a &= m;
@@ -3833,12 +3996,16 @@ static inline void fx_imul_flags(X64State *s, uint64_t r, __int128 full, int siz
 
 #define FX_FALLBACK (-2)   // run this one with step() instead; nothing has changed
 
-// Runs a decoded instruction: what step() does for it.
-static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
+// Runs a decoded instruction: what step() does for it. next: the address after
+// it; ea: its memory operand's host address. Returns FB_END instead of CONT when it
+// stored within the block's code (host addresses lo + span, FastOp.check).
+#define FB_END (-5)
+static inline __attribute__((always_inline))
+int fx_run(X64State *s, const X64Env *env, const FastOp *e, uint64_t next, uint64_t ea, uint64_t lo, uint64_t span,
+           const bool m32)
 {
-    uint64_t next = ipm(s, s->rip + e->len), ea = 0, v, t;
+    uint64_t v, t;
     int size = e->size;
-    if (e->mem) ea = fx_ea(s, e, next);
     switch (e->kind) {
     case FX_ALU_RM_R:
         if (e->aux == ALU_CMP) fx_alu(s, ALU_CMP, fx_get(s, e, ea, size), fx_getr(s, e, e->reg, size), size);
@@ -3857,7 +4024,7 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
     case FX_MOV_RM_R: fx_set(s, e, ea, size, fx_getr(s, e, e->reg, size)); break;
     case FX_MOV_R_RM: fx_setr(s, e, e->reg, size, fx_get(s, e, ea, size)); break;
     case FX_MOV_RM_I: fx_set(s, e, ea, size, e->imm); break;
-    case FX_LEA: fx_setr(s, e, e->reg, size, fx_offset(s, e, next)); break;
+    case FX_LEA: fx_setr(s, e, e->reg, size, fx_offset(s, e, next, m32)); break;
     case FX_INC: case FX_DEC: {
         uint64_t m = mask_of(size), a = fx_get(s, e, ea, size) & m;
         uint64_t r = (e->kind == FX_INC ? a + 1 : a - 1) & m;
@@ -3866,10 +4033,10 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
         fx_set(s, e, ea, size, r);
         break;
     }
-    case FX_PUSH_R: push(s, s->gpr[e->reg] & mask_of(size), size); break;
-    case FX_POP_R: v = pop(s, size); fx_setr(s, e, e->reg, size, v); break;
-    case FX_PUSH_I: push(s, e->imm & mask_of(size), size); break;
-    case FX_PUSH_RM: push(s, fx_get(s, e, ea, size), size); break;
+    case FX_PUSH_R: fx_push(s, s->gpr[e->reg] & mask_of(size), size, m32); break;
+    case FX_POP_R: v = fx_pop(s, size, m32); fx_setr(s, e, e->reg, size, v); break;
+    case FX_PUSH_I: fx_push(s, e->imm & mask_of(size), size, m32); break;
+    case FX_PUSH_RM: fx_push(s, fx_get(s, e, ea, size), size, m32); break;
     case FX_JCC:
         s->rip = (s->lazy_op ? lazy_cond(s, e->aux) : cond(s, e->aux)) ? e->imm : next;
         return CONT;
@@ -3879,18 +4046,18 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
         return CONT;
     case FX_CALL:
         if (native(env, e->imm)) return FX_FALLBACK;
-        push(s, next, s->mode32 ? 4 : 8);
+        fx_push(s, next, m32 ? 4 : 8, m32);
         s->rip = e->imm;
         return CONT;
     case FX_JMP_RM: case FX_CALL_RM:
-        t = ipm(s, fx_get(s, e, ea, s->mode32 ? 4 : 8));
+        t = fx_get(s, e, ea, m32 ? 4 : 8);
         if (native(env, t)) return FX_FALLBACK;
-        if (e->kind == FX_CALL_RM) push(s, next, s->mode32 ? 4 : 8);
+        if (e->kind == FX_CALL_RM) fx_push(s, next, m32 ? 4 : 8, m32);
         s->rip = t;
         return CONT;
     case FX_RET:
-        s->rip = pop(s, s->mode32 ? 4 : 8);
-        s->gpr[X64_RSP] = ipm(s, s->gpr[X64_RSP] + e->imm);
+        s->rip = fx_pop(s, m32 ? 4 : 8, m32);
+        s->gpr[X64_RSP] = m32 ? (uint32_t)(s->gpr[X64_RSP] + e->imm) : s->gpr[X64_RSP] + e->imm;
         return CONT;
     case FX_MOVZX: case FX_MOVSX:
         v = fx_get(s, e, ea, e->aux);
@@ -3918,7 +4085,8 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
     case FX_SHIFT: {
         unsigned count = e->imm == 256 ? (unsigned)(s->gpr[X64_RCX] & 0xff) : (unsigned)e->imm;
         unsigned masked = count & (size == 8 ? 63 : 31);
-        flags_flush(s);
+        if (e->aux < 4) flags_flush(s);            // rotates set CF and OF only (and RCL, RCR read CF)
+        else if (masked) s->lazy_op = LF_NONE;     // SHL SHR SAR set every arithmetic flag
         v = shift(s, e->aux, fx_get(s, e, ea, size), count, size);
         if (masked || size == 4) fx_set(s, e, ea, size, v);
         break;
@@ -3926,7 +4094,7 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
     case FX_SHIFTD: {
         unsigned count = e->imm == 256 ? (unsigned)(s->gpr[X64_RCX] & 0xff) : (unsigned)e->imm;
         unsigned masked = count & (size == 8 ? 63 : 31);
-        flags_flush(s);
+        if (masked) s->lazy_op = LF_NONE;          // it sets every arithmetic flag
         v = double_shift(s, e->aux, fx_get(s, e, ea, size), fx_getr(s, e, e->reg, size), count, size);
         if (masked || size == 4) fx_set(s, e, ea, size, v);
         break;
@@ -3941,7 +4109,10 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
     case FX_X87:
         if (s->lazy_op) flags_flush(s);   // FCOMI sets EFLAGS, FCMOVcc reads them
         s->rip = next;
-        return x87_body(s, e->aux, e->reg & 7, e->rm & 7, e->mem != 0, ea, (e->size & 1) != 0);
+        {
+            int r = x87_body(s, e->aux, e->reg & 7, e->rm & 7, e->mem != 0, ea, (e->size & 1) != 0);
+            return r == CONT && e->mem && ea - lo < span ? FB_END : r;
+        }
     case FX_SSE: {
         // The decoder's state, as step() would leave it for these.
         Dec d;
@@ -3954,7 +4125,7 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
         d.rm = d.rmf = 0;
         d.start = s->rip;
         d.next = next;
-        d.m32 = s->mode32;
+        d.m32 = m32;
         d.gbase = s->guest_base;
         d.rex = e->rex;
         d.rep = (e->size & 2) ? 0xF3 : (e->size & 4) ? 0xF2 : 0;
@@ -3970,7 +4141,7 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
             d.index = e->index == FX_NONE ? -1 : e->index;
             d.scale = e->scale;
             d.disp = e->disp;
-            d.off = fx_offset(s, e, next);
+            d.off = fx_offset(s, e, next, m32);
             d.ea = ea;
         } else {
             d.mod = 3;
@@ -3981,15 +4152,147 @@ static int fx_run(X64State *s, const X64Env *env, const FastEntry *e)
         s->rip = next;
         int pfx = d.rep == 0xF3 ? 2 : d.rep == 0xF2 ? 3 : d.opsize ? 1 : 0;
         uint8_t op = e->aux;
-        if (pfx == 0 && ((op >= 0x60 && op <= 0x7F) || op >= 0xD0 || op == 0xC4 || op == 0xC5)) return mmx_body(s, &d, op, (uint8_t)e->imm);
-        return sse_body(s, &d, op, pfx, (uint8_t)e->imm);
+        int r = pfx == 0 && ((op >= 0x60 && op <= 0x7F) || op >= 0xD0 || op == 0xC4 || op == 0xC5)
+            ? mmx_body(s, &d, op, (uint8_t)e->imm) : sse_body(s, &d, op, pfx, (uint8_t)e->imm);
+        return r == CONT && e->mem && ea - lo < span ? FB_END : r;
     }
+    // The common forms (fx_special). The operation is a constant in each.
+#define FX_ARITH(K, OP, WIDE, IMM) \
+    case K: { \
+        uint64_t a = s->gpr[e->rm], b = IMM ? e->imm : s->gpr[e->reg], r; \
+        if (!WIDE) { a = (uint32_t)a; b = (uint32_t)b; } \
+        r = fx_alu(s, OP, a, b, WIDE ? 8 : 4); \
+        if (OP != ALU_CMP) s->gpr[e->rm] = r; \
+        s->rip = next; \
+        return CONT; \
+    }
+#define FX_ARITH4(NAME, OP) \
+    FX_ARITH(FX_##NAME##_RR32, OP, 0, 0) FX_ARITH(FX_##NAME##_RR64, OP, 1, 0) \
+    FX_ARITH(FX_##NAME##_RI32, OP, 0, 1) FX_ARITH(FX_##NAME##_RI64, OP, 1, 1)
+    FX_ARITH4(ADD, ALU_ADD)
+    FX_ARITH4(SUB, ALU_SUB)
+    FX_ARITH4(CMP, ALU_CMP)
+    FX_ARITH4(AND, ALU_AND)
+    FX_ARITH4(OR, ALU_OR)
+    FX_ARITH4(XOR, ALU_XOR)
+#undef FX_ARITH4
+#undef FX_ARITH
+#define FX_SHIFT_RI(K, LF, WIDE, EXPR) \
+    case K: { \
+        uint64_t a = WIDE ? s->gpr[e->rm] : (uint32_t)s->gpr[e->rm], c = e->imm, r = EXPR; \
+        if (!WIDE) r = (uint32_t)r; \
+        lazy(s, LF, WIDE ? 8 : 4, a, c, r); \
+        s->gpr[e->rm] = r; \
+        s->rip = next; \
+        return CONT; \
+    }
+    FX_SHIFT_RI(FX_SHL_RI32, LF_SHL, 0, a << c)
+    FX_SHIFT_RI(FX_SHL_RI64, LF_SHL, 1, a << c)
+    FX_SHIFT_RI(FX_SHR_RI32, LF_SHR, 0, a >> c)
+    FX_SHIFT_RI(FX_SHR_RI64, LF_SHR, 1, a >> c)
+    FX_SHIFT_RI(FX_SAR_RI32, LF_SAR, 0, (uint64_t)(int64_t)((int32_t)a >> c))
+    FX_SHIFT_RI(FX_SAR_RI64, LF_SAR, 1, (uint64_t)((int64_t)a >> c))
+#undef FX_SHIFT_RI
+    case FX_TEST_RR32: fx_alu(s, ALU_AND, (uint32_t)s->gpr[e->rm], (uint32_t)s->gpr[e->reg], 4); s->rip = next; return CONT;
+    case FX_TEST_RR64: fx_alu(s, ALU_AND, s->gpr[e->rm], s->gpr[e->reg], 8); s->rip = next; return CONT;
+    case FX_TEST_RI32: fx_alu(s, ALU_AND, (uint32_t)s->gpr[e->rm], (uint32_t)e->imm, 4); s->rip = next; return CONT;
+    case FX_TEST_RI64: fx_alu(s, ALU_AND, s->gpr[e->rm], e->imm, 8); s->rip = next; return CONT;
+    case FX_MOV_RR32: s->gpr[e->rm] = (uint32_t)s->gpr[e->reg]; s->rip = next; return CONT;
+    case FX_MOV_RR64: s->gpr[e->rm] = s->gpr[e->reg]; s->rip = next; return CONT;
+    case FX_MOV_RI32: s->gpr[e->rm] = (uint32_t)e->imm; s->rip = next; return CONT;
+    case FX_MOV_RI64: s->gpr[e->rm] = e->imm; s->rip = next; return CONT;
+    case FX_LOAD32: s->gpr[e->reg] = (uint32_t)mem_read(ea, 4); s->rip = next; return CONT;
+    case FX_LOAD64: s->gpr[e->reg] = mem_read(ea, 8); s->rip = next; return CONT;
+    case FX_STORE32:
+        mem_write(ea, 4, (uint32_t)s->gpr[e->reg]);
+        s->rip = next;
+        return ea - lo < span ? FB_END : CONT;
+    case FX_STORE64:
+        mem_write(ea, 8, s->gpr[e->reg]);
+        s->rip = next;
+        return ea - lo < span ? FB_END : CONT;
     case FX_NOP: break;
     case FX_CWDE: fx_setr(s, e, X64_RAX, size, (uint64_t)sext(s->gpr[X64_RAX], size / 2)); break;
     case FX_CDQ: fx_setr(s, e, X64_RDX, size, (s->gpr[X64_RAX] & sign_of(size)) ? ~0ull : 0); break;
     }
     s->rip = next;
+    if (e->check) {
+        uint64_t a = e->check == FB_CHECK_EA ? ea : m32 ? s->guest_base + (uint32_t)s->gpr[X64_RSP] : s->gpr[X64_RSP];
+        if (a - lo < span) return FB_END;
+    }
     return CONT;
+}
+
+// Runs cached blocks from s->rip until an instruction needs step() (FB_STEP), the
+// run is to stop or its budget is spent (FB_TOP), or an instruction ends it (an
+// X64Exit, with *start and *length). The budget counts every instruction run.
+#define FB_STEP (-3)
+#define FB_TOP (-4)
+
+static inline __attribute__((always_inline))
+int fb_loop(X64State *s, const X64Env *env, void *cache, uint64_t *budget, uint64_t *start, size_t *length, const bool m32)
+{
+    const uint64_t stop = env->stop_rip;
+    uint64_t left = *budget;
+    for (;;) {
+        uint64_t rip = s->rip;
+        if (rip == stop || left == 0) { *budget = left; return FB_TOP; }
+        FastBlock *b = fb_lookup(cache, rip, m32);
+        const uint8_t *code = (const uint8_t *)(uintptr_t)(m32 ? s->guest_base + (uint32_t)rip : rip);
+        if (!fb_same(b, code)) fb_build(b, rip, code, m32);   // new, or changed, code
+        unsigned n = b->nops;
+        if (!n) { *budget = left; return FB_STEP; }
+        if (left < n) n = (unsigned)left;
+        if (stop - rip < b->nbytes) {   // the stop address is in the block: up to it
+            uint64_t a = rip;
+            unsigned i = 0;
+            while (i < n && a != stop) {
+                a += b->ops[i++].len;
+                if (m32) a = (uint32_t)a;
+            }
+            if (a == stop) n = i;
+        }
+        // Stores here might change the block's code (fx_run returns FB_END).
+        const uint64_t lo = (uint64_t)(uintptr_t)code - 128, span = b->nbytes + 128u;
+        const FastOp *e = b->ops, *end = e + n;
+        for (;;) {
+            uint64_t next = rip + e->len;
+            if (m32) next = (uint32_t)next;
+            uint64_t ea = e->mem ? fx_ea(s, e, next, m32) : 0;
+            s->insn_start = rip;
+            int r = fx_run(s, env, e, next, ea, lo, span, m32);
+            if (r != CONT) {
+                if (r == FB_END) {   // it may have changed the block's code: compare again first
+                    s->instructions++;
+                    e++;
+                    break;
+                }
+                if (left != UINT64_MAX) left -= (uint64_t)(e - b->ops);
+                if (r == FX_FALLBACK) { *budget = left; return FB_STEP; }   // nothing changed: step() runs it
+                if (left != UINT64_MAX) left--;
+                *budget = left;
+                *start = rip;
+                *length = e->len;
+                return r;
+            }
+            s->instructions++;
+            if (++e == end) break;
+            rip = next;
+        }
+        if (left != UINT64_MAX) left -= (uint64_t)(e - b->ops);
+    }
+}
+
+static __attribute__((noinline)) int fb_loop32(X64State *s, const X64Env *env, void *cache, uint64_t *budget,
+                                               uint64_t *start, size_t *length)
+{
+    return fb_loop(s, env, cache, budget, start, length, true);
+}
+
+static __attribute__((noinline)) int fb_loop64(X64State *s, const X64Env *env, void *cache, uint64_t *budget,
+                                               uint64_t *start, size_t *length)
+{
+    return fb_loop(s, env, cache, budget, start, length, false);
 }
 
 X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *info)
@@ -4006,20 +4309,16 @@ X64Exit x64_run(X64State *s, const X64Env *env, uint64_t budget, X64ExitInfo *in
             if (info) { memset(info, 0, sizeof *info); info->rip = s->rip; }
             break;
         }
-        if (budget != UINT64_MAX) budget--;
         uint64_t start = s->rip;
         if (cache) {
-            FastEntry *e = fx_entry(cache, start);
-            const uint8_t *code = (const uint8_t *)(uintptr_t)ha(s, start);
+            r = s->mode32 ? fb_loop32(s, env, cache, &budget, &start, &length)
+                          : fb_loop64(s, env, cache, &budget, &start, &length);
+            if (r == FB_TOP) continue;
+            if (r != FB_STEP) goto stopped;
+            start = s->rip;   // this one runs with step()
             s->insn_start = start;
-            if (e->tag != fx_tag(s, start) || e->kind == FX_EMPTY || !fx_same(e, code))
-                fx_decode(s, e, start, code);   // new, or changed, code
-            if (e->kind != FX_SLOW) {
-                r = fx_run(s, env, e);
-                if (r == CONT) { s->instructions++; continue; }
-                if (r != FX_FALLBACK) { length = e->len; goto stopped; }   // an exit, as step() gives it
-            }
         }
+        if (budget != UINT64_MAX) budget--;
         flags_flush(s);   // step() reads and writes rflags itself
         r = step(s, env, &d);
         if (r == CONT) { s->instructions++; continue; }

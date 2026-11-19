@@ -46,7 +46,8 @@ for op in ['inc', 'dec']:
 for producer, u in [('cmp eax, ebx', 0), ('sub ecx, edx', 0), ('add esi, edi', 0), ('cmp al, bh', 0), ('cmp cx, dx', 0),
                     ('and eax, ebx', AF), ('test ecx, edx', AF), ('xor ah, bl', AF), ('or ax, bx', AF), ('inc eax', 0),
                     ('dec cl', 0), ('neg ebx', 0), ('cmp eax, dword ptr [esi+8]', 0), ('add byte ptr [esi+3], 0x7f', 0),
-                    ('sbb ecx, edx', 0), ('adc eax, ebx', 0), ('sbb dl, 0x80', 0)]:
+                    ('sbb ecx, edx', 0), ('adc eax, ebx', 0), ('sbb dl, 0x80', 0),
+                    ('shl eax, 1', AF), ('shr ebx, 1', AF), ('sar ecx, 1', AF)]:
     for cc in ['o', 'no', 'b', 'ae', 'e', 'ne', 'be', 'a', 's', 'ns', 'p', 'np', 'l', 'ge', 'le', 'g']:
         t(f'{producer}; set{cc} dh', u)
     t(f'{producer}; cmovle ebp, eax; cmovb edi, ecx', u)
@@ -57,8 +58,22 @@ for producer, u in [('cmp eax, ebx', 0), ('sub ecx, edx', 0), ('add esi, edi', 0
     t(f'{producer}; shl ebp, 3', u | AF | OF)
     t(f'{producer}; shr edi, cl', u | AF | OF, RCX_SMALL)
     t(f'{producer}; rcl bp, 1', u)
+# Shifts by more than 1 leave OF undefined: read the other flags after them.
+for producer in ['shl edx, 7', 'shr esi, 31', 'sar edi, 9', 'shl ax, 3']:
+    t(f'{producer}; adc ebp, edi; setc dl; sete dh; sets bl; setp bh; seta al; inc ecx; setc ah', AF | OF)
+# The register forms of ADD r32, r/m32 and the like (03 C3 is ADD EAX, EBX), which compilers such as MSVC emit
+# and assemblers do not.
+for code, u in [('0x03, 0xc3', 0), ('0x2b, 0xd1', 0), ('0x3b, 0xc1', 0), ('0x23, 0xca', AF), ('0x0b, 0xd8', AF),
+                ('0x33, 0xc7', AF), ('0x13, 0xc3', 0), ('0x1b, 0xd1', 0), ('0x02, 0xc3', 0), ('0x66, 0x03, 0xc3', 0),
+                ('0x8b, 0xc3', 0), ('0x8b, 0xec', 0), ('0x8a, 0xc7', 0), ('0x66, 0x8b, 0xc3', 0)]:
+    t(f'.byte {code}', u)
 # Self-modifying code: each pass changes the immediate the next one runs (restored at the end).
 t('call 1f; 1: pop edx; .byte 0x81, 0xc2; .long 2f - 1b; mov ecx, 3; 2: mov eax, 0x11111111; add ebx, eax; inc byte ptr [edx+1]; dec ecx; jnz 2b; sub byte ptr [edx+1], 3')
+# ...and an instruction a few after the store, which the interpreter has already decoded with it (a 32-bit
+# store, a read-modify-write, an x87 store).
+t('call 1f; 1: pop edx; .byte 0x81, 0xc2; .long 3f - 1b; mov eax, 0x22222222; mov dword ptr [edx+1], eax; 3: mov ecx, 0x11111111; add ebx, ecx; mov dword ptr [edx+1], 0x11111111')
+t('call 1f; 1: pop edx; .byte 0x81, 0xc2; .long 3f - 1b; add dword ptr [edx+1], 0x11111111; 3: mov ecx, 0x11111111; add ebx, ecx; sub dword ptr [edx+1], 0x11111111')
+t('call 1f; 1: pop edx; .byte 0x81, 0xc2; .long 3f - 1b; mov dword ptr [esi], 0x22222222; fild dword ptr [esi]; fistp dword ptr [edx+1]; 3: mov ecx, 0x11111111; add ebx, ecx; mov dword ptr [edx+1], 0x11111111')
 t('mov ecx, 5; 1: add eax, ecx; dec ecx; jnz 1b')
 t('xor eax, eax; 1: add eax, 3; cmp eax, 30; jl 1b; sete bl')
 for op in ['neg', 'not']:

@@ -93,15 +93,16 @@ typedef struct X64Env {
     bool (*is_native)(void *user, uint64_t target);
     void *user;
     // Optional: X64_CACHE_SIZE bytes of zeroed memory, aligned to 64, that one
-    // thread at a time runs with (NULL: none). x64_run keeps the instructions it
-    // decodes there, and runs the common ones from it. Each time it runs a cached
-    // instruction it checks that the instruction's bytes are still the same, so
-    // code that changes (self-modifying code, a game's own JIT) is decoded again.
+    // thread at a time runs with (NULL: none). x64_run keeps blocks of the
+    // instructions it decodes there, and runs the common ones from them. Each time
+    // it runs a cached block it checks that the block's bytes are still the same,
+    // so code that changes (self-modifying code, a game's own JIT) is decoded again.
     void *cache;
 } X64Env;
 
-#define X64_CACHE_ENTRIES 8192u
-#define X64_CACHE_SIZE (X64_CACHE_ENTRIES * 64u)
+#define X64_CACHE_BLOCKS_LOG2 10
+#define X64_CACHE_BLOCK_SIZE 512u
+#define X64_CACHE_SIZE ((1u << X64_CACHE_BLOCKS_LOG2) * X64_CACHE_BLOCK_SIZE)
 
 typedef struct X64ExitInfo {
     uint64_t rip;           // address of the instruction that stopped the run

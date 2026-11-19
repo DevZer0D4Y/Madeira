@@ -98,6 +98,32 @@ static void *next_cache(void)
     return (runs++ & 1) ? NULL : fuzz_cache;
 }
 
+// Every third run goes in pieces of 1 to 5 instructions, each ending in X64_EXIT_BUDGET after
+// exactly that many, or sooner in another exit (a block can stop and resume part of the way
+// through): the result must be the same. Returns the piece size for the next run, or 0 for one.
+static volatile int piece_miscount;
+static unsigned next_piece(void)
+{
+    static unsigned runs;
+    runs++;
+    return runs % 3 == 2 ? 1 + runs % 5 : 0;
+}
+
+static X64Exit run_in_pieces(X64State *s, const X64Env *env, X64ExitInfo *info, unsigned piece)
+{
+    uint64_t left = 100000;
+    piece_miscount = 0;
+    if (!piece) return x64_run(s, env, left, info);
+    for (;;) {
+        uint64_t before = s->instructions, n = piece < left ? piece : left;
+        X64Exit exit = x64_run(s, env, n, info);
+        uint64_t ran = s->instructions - before;
+        if (exit == X64_EXIT_BUDGET ? ran != n : ran > n) piece_miscount = 1;   // never more than the budget
+        if (exit != X64_EXIT_BUDGET) return exit;
+        if (!(left -= n)) return exit;
+    }
+}
+
 static void dump_input(void)
 {
     for (int i = 0; i < 16; i++)
@@ -135,12 +161,14 @@ static void interpret_and_compare(size_t pre, size_t len, uint64_t undef, uint64
     X64Env env = { .stop_rip = CODE + pre + len, .cache = next_cache() };
     X64ExitInfo info;
     X64Exit exit = X64_EXIT_BUDGET;
+    volatile unsigned piece = next_piece();
     fault_signal = 0;
-    if (sigsetjmp(fault_jump, 1) == 0) exit = x64_run(&s, &env, 100000, &info);
+    if (sigsetjmp(fault_jump, 1) == 0) exit = run_in_pieces(&s, &env, &info, piece);
 
     int k = 0;
     why[0] = 0;
     if (fault_signal) { snprintf(why, size, "interpreter faulted with signal %d", fault_signal); return; }
+    if (piece_miscount) { snprintf(why, size, "runs of %u instructions ran another number", piece); return; }
     if (exit != X64_EXIT_STOP) {
         k = snprintf(why, size, " exit %s at %llx:", x64_exit_name(exit), (unsigned long long)info.rip);
         for (int i = 0; i < info.length && k < (int)size - 4; i++) k += snprintf(why + k, size - (size_t)k, " %02x", info.bytes[i]);
@@ -297,8 +325,9 @@ static bool f80_close(const uint8_t *a, const uint8_t *b, bool approx)
 static X64Exit run_guarded(X64State *s, const X64Env *env, X64ExitInfo *info)
 {
     volatile X64Exit exit = X64_EXIT_BUDGET;
+    volatile unsigned piece = next_piece();
     fault_signal = 0;
-    if (sigsetjmp(fault_jump, 1) == 0) exit = x64_run(s, env, 100000, info);
+    if (sigsetjmp(fault_jump, 1) == 0) exit = run_in_pieces(s, env, info, piece);
     return exit;
 }
 
@@ -344,6 +373,7 @@ static int replay32(FILE *f)
             int k = 0;
             why[0] = 0;
             if (fault_signal) snprintf(why, sizeof why, " interpreter faulted with signal %d", fault_signal);
+            else if (piece_miscount) snprintf(why, sizeof why, " runs of a few instructions ran another number");
             else if (exit != X64_EXIT_STOP) {
                 k = snprintf(why, sizeof why, " exit %s at %llx:", x64_exit_name(exit), (unsigned long long)info.rip);
                 for (int i = 0; i < info.length; i++) k += snprintf(why + k, sizeof why - (size_t)k, " %02x", info.bytes[i]);
